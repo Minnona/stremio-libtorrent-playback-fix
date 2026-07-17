@@ -27,6 +27,7 @@ pub(crate) struct LibtorrentDiskFileStream {
     current_pos: u64,
     stream_id: usize,
     playback_intent: PlaybackIntent,
+    multi_file_mode: bool,
     piece_waiter: Arc<PieceWaiterRegistry>,
     metadata_pins: Arc<MetadataPinRegistry>,
     created_at: Instant,
@@ -58,6 +59,7 @@ impl LibtorrentDiskFileStream {
         playback_intent: PlaybackIntent,
         piece_waiter: Arc<PieceWaiterRegistry>,
         metadata_pins: Arc<MetadataPinRegistry>,
+        multi_file_mode: bool,
     ) -> Self {
         let mut handle = handle;
         // Pieces verified moments ago (e.g. the shared boundary piece of the
@@ -79,6 +81,7 @@ impl LibtorrentDiskFileStream {
             current_pos: 0,
             stream_id,
             playback_intent,
+            multi_file_mode,
             piece_waiter,
             metadata_pins,
             created_at: Instant::now(),
@@ -267,8 +270,10 @@ impl LibtorrentDiskFileStream {
         // window below. set_file_priority resets stale per-piece priorities so a
         // previous request's window cannot keep unrelated pieces ahead.
         let file_baseline = disk_backed_file_baseline_priority(priority_intent);
-        self.handle
-            .set_file_priority(self.file_idx as i32, file_baseline);
+        if !self.multi_file_mode {
+            self.handle
+                .set_file_priority(self.file_idx as i32, file_baseline);
+        }
         let deadline_jitter = (self.stream_id % 10) as i32 * 5;
         for p in piece..=self.last_piece.min(piece + forward_window) {
             if !self.handle.have_piece(p) {
@@ -310,7 +315,7 @@ impl LibtorrentDiskFileStream {
 
         let priority_intent = self.priority_intent();
         let file_baseline = disk_backed_file_baseline_priority(priority_intent);
-        if file_baseline == 0 {
+        if file_baseline == 0 && !self.multi_file_mode {
             self.handle.set_file_priority(self.file_idx as i32, 0);
         }
         self.handle.set_piece_priority(piece, 7);
@@ -357,7 +362,7 @@ impl LibtorrentDiskFileStream {
         }
 
         let file_baseline = disk_backed_file_baseline_priority(priority_intent);
-        if file_baseline == 0 {
+        if file_baseline == 0 && !self.multi_file_mode {
             self.handle.set_file_priority(self.file_idx as i32, 0);
         }
         for p in piece..=self.last_piece.min(piece + forward_window) {

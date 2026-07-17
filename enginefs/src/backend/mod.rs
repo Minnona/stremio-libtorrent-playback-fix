@@ -2,6 +2,8 @@ use anyhow::Result;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncSeek};
 
+use priorities::PlaybackIntent;
+
 #[cfg(feature = "librqbit")]
 pub mod librqbit;
 
@@ -74,6 +76,11 @@ pub trait TorrentHandle: Send + Sync + Clone {
     async fn keep_file_downloading(&self, _file_idx: usize) -> Result<()> {
         Ok(())
     }
+    /// Reconcile wanted files for multi-file torrents. Backends that cannot
+    /// apply per-file priorities may leave this as a no-op.
+    async fn reconcile_file_priorities(&self, _plan: TorrentFilePriorityPlan) -> Result<()> {
+        Ok(())
+    }
     async fn get_file_reader(
         &self,
         file_idx: usize,
@@ -83,6 +90,9 @@ pub trait TorrentHandle: Send + Sync + Clone {
         intent: priorities::PlaybackIntent,
     ) -> Result<Box<dyn FileStreamTrait>>;
     async fn get_files(&self) -> Vec<BackendFileInfo>;
+    async fn file_count(&self) -> usize {
+        self.get_files().await.len()
+    }
     /// Get the local filesystem path for a file (for probing without HTTP loopback)
     async fn get_file_path(&self, file_idx: usize) -> Option<String>;
     /// Prepare a file for streaming by setting its priority and waiting for initial pieces.
@@ -100,6 +110,23 @@ pub trait TorrentHandle: Send + Sync + Clone {
         timeout: Duration,
         intent: priorities::PlaybackIntent,
     ) -> Result<PieceReadiness>;
+}
+
+#[derive(Debug, Clone)]
+pub struct TorrentFilePriorityPlan {
+    pub active_file: Option<usize>,
+    pub hot_file: Option<HotFilePriorityPlan>,
+    pub generation: u64,
+    pub reason: &'static str,
+}
+
+#[derive(Debug, Clone)]
+pub struct HotFilePriorityPlan {
+    pub file_idx: usize,
+    pub start_offset: u64,
+    pub priority: u8,
+    pub intent: PlaybackIntent,
+    pub bitrate_bytes_per_sec: Option<u64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

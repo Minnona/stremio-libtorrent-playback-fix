@@ -157,6 +157,9 @@ async fn memory_snapshot_for_state(state: &AppState) -> MemorySnapshot {
     for lease in &download_engine.streams.active_playback_leases {
         active_disk_files.insert((lease.info_hash.clone(), lease.file_idx));
     }
+    for selection in &download_engine.streams.active_multifile_selections {
+        active_disk_files.insert((selection.info_hash.clone(), selection.file_idx));
+    }
     let active_disk_downloads = active_disk_files.len() as u64;
 
     MemorySnapshot {
@@ -225,8 +228,17 @@ pub fn start_memory_sampler(state: AppState) -> tokio::task::JoinHandle<()> {
                     thread_count = snapshot.process.thread_count,
                     engine_count = snapshot.engine.streams.engine_count,
                     engine_active_streams = snapshot.engine.streams.engine_active_streams,
+                    active_file_priority_generation =
+                        snapshot.engine.streams.active_file_priority_generation,
                     active_stream_hashes = snapshot.engine.streams.active_streams.len(),
                     active_file_streams = snapshot.engine.streams.active_file_streams.len(),
+                    active_multifile_selections =
+                        snapshot.engine.streams.active_multifile_selections.len(),
+                    idle_paused_torrents = snapshot.engine.streams.idle_paused_torrents.len(),
+                    download_active_multifile_selections =
+                        snapshot.download_engine.streams.active_multifile_selections.len(),
+                    download_idle_paused_torrents =
+                        snapshot.download_engine.streams.idle_paused_torrents.len(),
                     rust_piece_cache_entries = snapshot.engine.memory.rust_piece_cache_entries,
                     rust_piece_cache_bytes = snapshot.engine.memory.rust_piece_cache_bytes,
                     native_storage_bytes = snapshot.engine.memory.native_storage_bytes,

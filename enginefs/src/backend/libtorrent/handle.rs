@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::backend::{
-    BackendFileInfo, EngineStats, FileStreamTrait, PieceReadiness,
+    BackendFileInfo, EngineStats, FileStreamTrait, PieceReadiness, TorrentFilePriorityPlan,
     TorrentHandle as TorrentHandleTrait,
     metadata::MetadataInspector,
     priorities::{
@@ -281,6 +281,114 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
         Ok(())
     }
 
+    async fn reconcile_file_priorities(&self, plan: TorrentFilePriorityPlan) -> Result<()> {
+        let session = self.session.read().await;
+        let mut handle = session
+            .find_torrent(&self.info_hash)
+            .map_err(|e| anyhow!("Torrent not found: {}", e))?;
+        let files = handle.files();
+        if files.len() <= 1 {
+            return Ok(());
+        }
+
+        for idx in 0..files.len() {
+            let priority = if Some(idx) == plan.active_file { 1 } else { 0 };
+            handle.set_file_priority(idx as i32, priority);
+        }
+
+        let mut hot_piece = None;
+        if let Some(hot_file) = plan.hot_file.as_ref()
+            && Some(hot_file.file_idx) == plan.active_file
+            && let Some(file_info) = files.get(hot_file.file_idx)
+        {
+            let piece_length = handle.piece_length() as u64;
+            if piece_length > 0 {
+                let start_offset = hot_file.start_offset.min(file_info.size.max(0) as u64);
+                let piece = ((file_info.offset.max(0) as u64 + start_offset) / piece_length) as i32;
+                if piece >= file_info.first_piece && piece <= file_info.last_piece {
+                    hot_piece = Some(piece);
+                    handle
+                        .set_sequential_download(disk_backed_sequential_download(hot_file.intent));
+
+                    let status = handle.status();
+                    let native_memory = libtorrent_sys::memory_storage_stats();
+                    let memory_pressure = if self.config.cache.size > 0
+                        && native_memory.total_bytes
+                            >= self.config.cache.size.saturating_mul(80) / 100
+                    {
+                        MemoryPressure::High
+                    } else {
+                        MemoryPressure::Normal
+                    };
+                    let decision = PlaybackPriorityPolicy::decide(PriorityContext {
+                        intent: hot_file.intent,
+                        current_piece: piece,
+                        first_piece: file_info.first_piece,
+                        last_piece: file_info.last_piece,
+                        piece_length,
+                        file_size: file_info.size.max(0) as u64,
+                        bitrate_bytes_per_sec: hot_file.bitrate_bytes_per_sec,
+                        download_rate_bytes_per_sec: status.download_rate as u64,
+                        peers: status.num_peers as u64,
+                        cache_size_bytes: self.config.cache.size,
+                        memory_pressure,
+                        consecutive_waits: 0,
+                        first_byte_sent: false,
+                    });
+
+                    for assignment in &decision.assignments {
+                        if assignment.piece_idx >= file_info.first_piece
+                            && assignment.piece_idx <= file_info.last_piece
+                            && !handle.have_piece(assignment.piece_idx)
+                        {
+                            handle.set_piece_priority(
+                                assignment.piece_idx,
+                                assignment.piece_priority,
+                            );
+                            handle.set_piece_deadline(assignment.piece_idx, assignment.deadline);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut verified_pins = Vec::new();
+        if let Some(active_file) = plan.active_file.and_then(|idx| files.get(idx)) {
+            let pinned = self.metadata_pins.pinned(&self.info_hash);
+            for piece in pinned {
+                if piece < active_file.first_piece || piece > active_file.last_piece {
+                    continue;
+                }
+                if handle.have_piece(piece) {
+                    verified_pins.push(piece);
+                } else {
+                    handle.set_piece_priority(piece, 7);
+                    handle.set_piece_deadline(piece, 0);
+                }
+            }
+        }
+        drop(handle);
+        drop(session);
+        self.metadata_pins
+            .unpin_pieces(&self.info_hash, &verified_pins);
+
+        let skipped_files = match plan.active_file {
+            Some(_) => files.len().saturating_sub(1),
+            None => files.len(),
+        };
+        tracing::info!(
+            info_hash = %self.info_hash,
+            active_file = plan.active_file,
+            skipped_files,
+            hot_piece,
+            generation = plan.generation,
+            reason = plan.reason,
+            "priority_reconcile_multifile"
+        );
+
+        Ok(())
+    }
+
     async fn get_file_reader(
         &self,
         file_idx: usize,
@@ -297,6 +405,7 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
         self.label_memory_storage();
 
         let files = handle.files();
+        let multi_file_mode = files.len() > 1;
         let file_info = files
             .get(file_idx)
             .ok_or_else(|| anyhow!("File index {} out of range", file_idx))?;
@@ -395,7 +504,7 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             }
         };
 
-        if priority != 255 {
+        if priority != 255 && !multi_file_mode {
             // Disk-backed streaming uses a strict baseline of 0 for cold
             // playback/metadata requests. The explicit piece window below is
             // raised immediately after this, which prevents stale/background
@@ -409,6 +518,12 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                 file_info.path
             );
             handle.set_file_priority(file_idx as i32, file_baseline);
+        } else if priority != 255 {
+            tracing::debug!(
+                info_hash = %self.info_hash,
+                file_idx,
+                "get_file_reader: skipping direct file baseline in multi-file mode"
+            );
         }
         if needs_resume {
             // Reannounce AFTER the file priority change above, not before: an
@@ -617,6 +732,7 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                 playback_intent,
                 self.piece_waiter.clone(),
                 self.metadata_pins.clone(),
+                multi_file_mode,
             )));
         }
 
@@ -795,6 +911,7 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                 .map_err(|e| anyhow::anyhow!("Torrent not found: {}", e))?;
 
             let files = handle.files();
+            let multi_file_mode = files.len() > 1;
             let file_info = files
                 .get(file_idx)
                 .ok_or_else(|| anyhow::anyhow!("File index {} out of range", file_idx))?;
@@ -834,7 +951,15 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             } else {
                 1
             };
-            handle.set_file_priority(file_idx as i32, prepare_baseline);
+            if multi_file_mode {
+                tracing::debug!(
+                    info_hash = %self.info_hash,
+                    file_idx,
+                    "prepare_file_for_streaming: deferring file priority to multi-file selector"
+                );
+            } else {
+                handle.set_file_priority(file_idx as i32, prepare_baseline);
+            }
 
             // REMOVED: First-8-pieces prioritization was causing seeks to fail
             // because it set highest priority on pieces 0-7 even when seeking to piece 118.
@@ -1059,6 +1184,14 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
         let mut handle = session
             .find_torrent(&self.info_hash)
             .map_err(|e| anyhow!("Torrent not found: {}", e))?;
+        if handle.files().len() > 1 {
+            tracing::debug!(
+                info_hash = %self.info_hash,
+                file_idx,
+                "keep_file_downloading: skipped in multi-file mode"
+            );
+            return Ok(());
+        }
 
         handle.set_file_priority(file_idx as i32, 1);
 
@@ -1105,13 +1238,14 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             .checked_sub(std::time::Duration::from_secs(5))
             .unwrap_or_else(std::time::Instant::now);
 
-        let (piece, first_piece, last_piece, piece_length, file_size) = {
+        let (piece, first_piece, last_piece, piece_length, file_size, multi_file_mode) = {
             let session = self.session.read().await;
             let mut handle = session
                 .find_torrent(&self.info_hash)
                 .map_err(|e| anyhow!("Torrent not found: {}", e))?;
             self.label_memory_storage();
             let files = handle.files();
+            let multi_file_mode = files.len() > 1;
             let file_info = files
                 .get(file_idx)
                 .ok_or_else(|| anyhow!("File index {} out of range", file_idx))?;
@@ -1166,7 +1300,7 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                 first_byte_sent: false,
             });
             let file_baseline = self.file_baseline_priority_for(intent);
-            if matches!(self.storage_mode, LibtorrentStorageMode::DiskBacked) {
+            if matches!(self.storage_mode, LibtorrentStorageMode::DiskBacked) && !multi_file_mode {
                 handle.set_file_priority(file_idx as i32, file_baseline);
             }
             for assignment in &decision.assignments {
@@ -1192,6 +1326,7 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                 file_info.last_piece,
                 piece_length,
                 file_info.size as u64,
+                multi_file_mode,
             )
         };
 
@@ -1287,7 +1422,7 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                 {
                     last_cluster_reassert = std::time::Instant::now();
                     let file_baseline = self.file_baseline_priority_for(intent);
-                    if file_baseline == 0 {
+                    if file_baseline == 0 && !multi_file_mode {
                         handle.set_file_priority(file_idx as i32, 0);
                     }
                     let cluster_end =

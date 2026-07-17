@@ -8,12 +8,12 @@ use axum::{
 };
 
 use axum::http::HeaderMap;
-use enginefs::backend::{TorrentHandle, priorities::PlaybackIntent};
+use enginefs::backend::{HotFilePriorityPlan, TorrentHandle, priorities::PlaybackIntent};
 use futures_util::Stream;
 use std::path::Path as FsPath;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncSeekExt;
@@ -91,6 +91,47 @@ impl<S: Stream + Unpin> Stream for StreamGuard<S> {
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.inner.size_hint()
+    }
+}
+
+/// Counts a request as active while its magnet metadata and automatic file
+/// selection are being resolved. A normal `FileHandle` takes over this count
+/// once streaming begins.
+struct MetadataResolutionGuard {
+    active_readers: Arc<AtomicUsize>,
+}
+
+impl MetadataResolutionGuard {
+    async fn acquire<H: TorrentHandle>(engine: &Arc<enginefs::engine::Engine<H>>) -> Self {
+        let active_readers = engine.active_streams.clone();
+        active_readers.fetch_add(1, Ordering::SeqCst);
+        let guard = Self { active_readers };
+
+        engine.touch();
+        if engine.idle_paused.load(Ordering::SeqCst) {
+            if let Err(error) = engine.handle.resume_torrent().await {
+                tracing::warn!(
+                    info_hash = %engine.info_hash,
+                    %error,
+                    "Failed to resume torrent while resolving stream metadata"
+                );
+            } else {
+                engine.idle_paused.store(false, Ordering::SeqCst);
+                tracing::info!(
+                    info_hash = %engine.info_hash,
+                    "torrent_resumed_for_metadata_resolution"
+                );
+            }
+        }
+
+        guard
+    }
+}
+
+impl Drop for MetadataResolutionGuard {
+    fn drop(&mut self) {
+        let previous = self.active_readers.fetch_sub(1, Ordering::SeqCst);
+        debug_assert!(previous > 0, "metadata activity counter underflowed");
     }
 }
 
@@ -325,6 +366,7 @@ pub async fn head_stream_video(
         }
     };
 
+    let _metadata_resolution = MetadataResolutionGuard::acquire(&engine).await;
     let files = engine.handle.get_files().await;
     let candidates = files
         .iter()
@@ -475,6 +517,7 @@ pub async fn stream_video(
         }
     };
 
+    let mut _metadata_resolution = MetadataResolutionGuard::acquire(&engine).await;
     let mut files = engine.handle.get_files().await;
     let filters = compat::query_values(query_str.as_deref(), "f");
     let candidates = files
@@ -587,6 +630,7 @@ pub async fn stream_video(
                 }
             };
 
+            _metadata_resolution = MetadataResolutionGuard::acquire(&engine).await;
             files = engine.handle.get_files().await;
             let candidates = files
                 .iter()
@@ -685,6 +729,20 @@ pub async fn stream_video(
             .refresh_hls_playback(&info_hash, idx, "hls-loopback")
             .await;
     }
+    engine_fs
+        .activate_multifile_file_for_playback(
+            &info_hash,
+            idx,
+            Some(HotFilePriorityPlan {
+                file_idx: idx,
+                start_offset: start_offset_hint,
+                priority,
+                intent: playback_intent,
+                bitrate_bytes_per_sec: None,
+            }),
+            "stream-read",
+        )
+        .await;
     let lifecycle = StreamLifecycleGuard::new(engine_fs.clone(), info_hash.clone(), idx, stream_id);
     engine_fs.focus_torrent(&info_hash).await;
 
@@ -1008,6 +1066,19 @@ fn parse_range(header: &str, size: u64) -> Option<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_resolution_guard_balances_the_active_reader_count() {
+        let active_readers = Arc::new(AtomicUsize::new(0));
+        {
+            let _guard = MetadataResolutionGuard {
+                active_readers: active_readers.clone(),
+            };
+            active_readers.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(active_readers.load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(active_readers.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn parses_standard_ranges() {

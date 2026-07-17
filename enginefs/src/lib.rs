@@ -3,7 +3,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::debug;
@@ -31,7 +31,10 @@ use crate::backend::librqbit::LibrqbitBackend;
 #[cfg(feature = "libtorrent")]
 use crate::backend::libtorrent::LibtorrentBackend;
 
-use crate::backend::{BackendMemoryDiagnostics, TorrentBackend, TorrentHandle, TorrentSource};
+use crate::backend::{
+    BackendMemoryDiagnostics, HotFilePriorityPlan, TorrentBackend, TorrentFilePriorityPlan,
+    TorrentHandle, TorrentSource,
+};
 
 const INACTIVE_TORRENT_REMOVE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
 const INACTIVE_TORRENT_PAUSE_GRACE: Duration = Duration::from_secs(15);
@@ -80,6 +83,10 @@ pub struct BackendEngineFS<B: TorrentBackend> {
     /// HLS playback is made of short segment reads. A lease keeps the file wanted
     /// while the player is buffered and no response body is currently open.
     active_playback_leases: Arc<RwLock<HashMap<(String, usize), PlaybackLease>>>,
+    /// For multi-file torrents, only the latest requested file is allowed to be
+    /// wanted at a time. Single-file torrents bypass this selector.
+    active_multifile_files: Arc<RwLock<HashMap<String, MultiFileActiveSelection>>>,
+    priority_generation: Arc<AtomicU64>,
     /// Optional disk cache for persisting completed files
     disk_cache: Option<Arc<disk_cache::DiskCacheManager>>,
     /// When false, torrents are paused once their download completes.
@@ -90,6 +97,14 @@ pub struct BackendEngineFS<B: TorrentBackend> {
 struct PlaybackLease {
     last_seen_secs: u64,
     expires_at_secs: u64,
+}
+
+#[derive(Debug, Clone)]
+struct MultiFileActiveSelection {
+    file_idx: usize,
+    generation: u64,
+    source: &'static str,
+    last_seen_secs: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -114,14 +129,26 @@ pub struct ActivePlaybackLeaseSnapshot {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MultiFileActiveSelectionSnapshot {
+    pub info_hash: String,
+    pub file_idx: usize,
+    pub generation: u64,
+    pub source: String,
+    pub last_seen_secs: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StreamActivitySnapshot {
     pub uptime_secs: u64,
     pub engine_count: usize,
     pub engine_active_streams: usize,
+    pub active_file_priority_generation: u64,
     pub active_streams: HashMap<String, usize>,
     pub active_file_streams: Vec<ActiveFileStreamSnapshot>,
     pub active_file: Option<ActiveFileSnapshot>,
     pub active_playback_leases: Vec<ActivePlaybackLeaseSnapshot>,
+    pub active_multifile_selections: Vec<MultiFileActiveSelectionSnapshot>,
+    pub idle_paused_torrents: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -180,6 +207,8 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             active_file_streams: Arc::new(RwLock::new(HashMap::new())),
             active_file: Arc::new(RwLock::new(None)),
             active_playback_leases: Arc::new(RwLock::new(HashMap::new())),
+            active_multifile_files: Arc::new(RwLock::new(HashMap::new())),
+            priority_generation: Arc::new(AtomicU64::new(0)),
             disk_cache: None,
             seeding_enabled: Arc::new(AtomicBool::new(true)),
         };
@@ -190,6 +219,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         let active_file_streams_clone = efs.active_file_streams.clone();
         let active_file_clone = efs.active_file.clone();
         let active_playback_leases_clone = efs.active_playback_leases.clone();
+        let active_multifile_files_clone = efs.active_multifile_files.clone();
         let seeding_flag = efs.seeding_enabled.clone();
         tokio::spawn(async move {
             loop {
@@ -233,12 +263,34 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                         continue;
                     }
 
+                    let active_selection = {
+                        let mut selections = active_multifile_files_clone.write().await;
+                        match selections.get(&info_hash).cloned() {
+                            Some(selection) if selection.file_idx == file_idx => {
+                                selections.remove(&info_hash);
+                                tracing::info!(
+                                    info_hash = %info_hash,
+                                    file_idx,
+                                    generation = selection.generation,
+                                    reason = "hls-lease-expired",
+                                    "multifile_active_file_cleared"
+                                );
+                                None
+                            }
+                            Some(selection) => Some(selection),
+                            None => None,
+                        }
+                    };
+
                     {
                         let mut active = active_file_clone.write().await;
-                        if let Some((ref h, idx)) = *active {
-                            if h == &info_hash && idx == file_idx {
-                                *active = None;
-                            }
+                        if let Some((ref h, idx)) = *active
+                            && h == &info_hash
+                            && idx == file_idx
+                        {
+                            *active = active_selection
+                                .as_ref()
+                                .map(|selection| (info_hash.clone(), selection.file_idx));
                         }
                     }
 
@@ -247,6 +299,23 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                         engines.get(&info_hash).cloned()
                     };
                     if let Some(engine) = engine {
+                        let reconciled = Self::reconcile_multifile_engine(
+                            engine.clone(),
+                            active_selection
+                                .as_ref()
+                                .map(|selection| selection.file_idx),
+                            None,
+                            active_selection
+                                .as_ref()
+                                .map(|selection| selection.generation)
+                                .unwrap_or(0),
+                            "hls-lease-expired",
+                        )
+                        .await;
+                        if reconciled {
+                            continue;
+                        }
+
                         if let Err(err) = engine.handle.clear_file_streaming(file_idx).await {
                             tracing::warn!(
                                 info_hash = %info_hash,
@@ -306,6 +375,10 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                                 .map(|(stream_hash, _)| stream_hash == hash)
                                 .unwrap_or(false)
                         };
+                        let active_multifile_matches = {
+                            let selections = active_multifile_files_clone.read().await;
+                            selections.contains_key(hash)
+                        };
 
                         let skip_reason = if engine_active_streams > 0 {
                             Some("engine_active_streams")
@@ -317,6 +390,8 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                             Some("active_playback_leases")
                         } else if active_file_matches {
                             Some("active_file")
+                        } else if active_multifile_matches {
+                            Some("active_multifile_file")
                         } else {
                             None
                         };
@@ -329,6 +404,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                                 active_stream_count,
                                 active_file_stream_count,
                                 active_playback_lease_count,
+                                active_multifile_matches,
                                 removed = false,
                                 skip_reason,
                                 "Skipping inactive-engine cleanup"
@@ -341,6 +417,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                                 active_stream_count,
                                 active_file_stream_count,
                                 active_playback_lease_count,
+                                active_multifile_matches,
                                 removed = true,
                                 "Scheduling inactive-engine cleanup"
                             );
@@ -376,92 +453,64 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     }
                 }
 
-                // Stop seeding on finished torrents when the user has seeding
-                // disabled -- WITHOUT pausing. A full pause disconnects every
-                // peer, and after a long idle the swarm can't be re-acquired
-                // (tracker min-announce-intervals + decayed DHT), which leaves
-                // the next episode stuck at zero peers. Instead we clamp the
-                // upload rate to a trickle while keeping the torrent connected,
-                // so a newly-requested file downloads instantly from the peers
-                // that were never dropped. on_stream_start() restores unlimited
-                // upload the moment any stream begins.
+                // Stop all torrent activity when seeding is disabled and no
+                // playback is active. A later playback request resumes the
+                // torrent before making its requested file wanted.
                 if !seeding_flag.load(Ordering::Relaxed) {
                     let read = engines_clone.read().await;
                     for (hash, engine) in read.iter() {
-                        let stats = engine.handle.stats().await;
-
-                        // `is_finished` is torrent-wide ("all wanted pieces
-                        // downloaded"), not per-file. on_stream_start() bumps the
-                        // new file's priority moments after the stream begins, so
-                        // in a brief window a brand-new stream on an undownloaded
-                        // file can coexist with is_finished still reading true.
-                        // Only throttle when no active file is still downloading,
-                        // so an in-progress download never loses its tit-for-tat
-                        // upload (and thus its download speed).
-                        let active_file_indices: Vec<usize> = {
-                            let mut indices = Vec::new();
-                            let streams = active_file_streams_clone.read().await;
-                            indices.extend(
-                                streams
-                                    .iter()
-                                    .filter(|((stream_hash, _), count)| {
-                                        stream_hash == hash && **count > 0
-                                    })
-                                    .map(|((_, file_idx), _)| *file_idx),
-                            );
-                            drop(streams);
-
-                            let leases = active_playback_leases_clone.read().await;
-                            indices.extend(
-                                leases
-                                    .iter()
-                                    .filter(|((stream_hash, _), lease)| {
-                                        stream_hash == hash && playback_lease_is_active(lease, now)
-                                    })
-                                    .map(|((_, file_idx), _)| *file_idx),
-                            );
-                            indices.sort_unstable();
-                            indices.dedup();
-                            indices
+                        let hash_active = {
+                            let streams = active_streams_clone.read().await;
+                            streams.get(hash).copied().unwrap_or(0) > 0
                         };
-                        let active_file_incomplete = active_file_indices.iter().any(|idx| {
-                            stats
-                                .files
-                                .get(*idx)
-                                .map(|f| f.progress < 1.0)
-                                .unwrap_or(true)
-                        });
-                        if active_file_incomplete {
+                        let file_active = {
+                            let streams = active_file_streams_clone.read().await;
+                            streams
+                                .iter()
+                                .any(|((stream_hash, _), count)| stream_hash == hash && *count > 0)
+                        };
+                        let playback_active = {
+                            let leases = active_playback_leases_clone.read().await;
+                            leases.iter().any(|((stream_hash, _), lease)| {
+                                stream_hash == hash && playback_lease_is_active(lease, now)
+                            })
+                        };
+                        let multifile_active = {
+                            let selections = active_multifile_files_clone.read().await;
+                            selections.contains_key(hash)
+                        };
+                        let reader_active = engine.active_streams.load(Ordering::SeqCst) > 0;
+                        if hash_active
+                            || file_active
+                            || playback_active
+                            || multifile_active
+                            || reader_active
+                        {
                             continue;
                         }
 
-                        // Only throttle a torrent that has FINISHED downloading
-                        // its wanted data and is therefore purely seeding. A
-                        // torrent still downloading -- or a freshly added magnet
-                        // without metadata yet -- must keep full upload so its
-                        // tit-for-tat download speed is unaffected.
-                        if !stats.has_metadata || !stats.is_finished {
+                        // A magnet that is still fetching its info dictionary
+                        // must remain connected to the swarm. Inactive engines
+                        // are removed by the separate cleanup policy.
+                        if !engine.handle.stats().await.has_metadata {
                             continue;
                         }
 
-                        // Only act on a real transition so we don't redundantly
-                        // re-clamp / re-log every 15s.
-                        if engine.upload_throttled.swap(true, Ordering::Relaxed) {
+                        if engine.idle_paused.swap(true, Ordering::Relaxed) {
                             continue;
                         }
 
                         tracing::info!(
                             info_hash = %hash,
-                            upload_speed = stats.upload_speed,
-                            "Throttling seeding on idle finished torrent (seeding disabled)"
+                            "torrent_paused_idle"
                         );
-                        if let Err(e) = engine.handle.set_upload_throttled(true).await {
+                        if let Err(e) = engine.handle.pause_torrent().await {
                             tracing::warn!(
                                 info_hash = %hash,
                                 error = %e,
-                                "Failed to throttle idle torrent upload"
+                                "Failed to pause idle torrent"
                             );
-                            engine.upload_throttled.store(false, Ordering::Relaxed);
+                            engine.idle_paused.store(false, Ordering::Relaxed);
                         }
                     }
                 }
@@ -553,6 +602,11 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     .load(std::sync::atomic::Ordering::SeqCst)
             })
             .sum();
+        let idle_paused_torrents = engines
+            .iter()
+            .filter(|(_, engine)| engine.idle_paused.load(Ordering::Relaxed))
+            .map(|(hash, _)| hash.clone())
+            .collect();
         drop(engines);
 
         let active_streams = self.active_streams.read().await.clone();
@@ -592,15 +646,31 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 },
             )
             .collect();
+        let active_multifile_selections = self
+            .active_multifile_files
+            .read()
+            .await
+            .iter()
+            .map(|(info_hash, selection)| MultiFileActiveSelectionSnapshot {
+                info_hash: info_hash.clone(),
+                file_idx: selection.file_idx,
+                generation: selection.generation,
+                source: selection.source.to_string(),
+                last_seen_secs: selection.last_seen_secs,
+            })
+            .collect();
 
         StreamActivitySnapshot {
             uptime_secs: now,
             engine_count,
             engine_active_streams,
+            active_file_priority_generation: self.priority_generation.load(Ordering::Relaxed),
             active_streams,
             active_file_streams,
             active_file,
             active_playback_leases,
+            active_multifile_selections,
+            idle_paused_torrents,
         }
     }
 
@@ -648,32 +718,13 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         keep_file_downloading: bool,
         source: &'static str,
     ) {
+        let mut is_multifile = false;
         if let Some(engine) = self.get_engine(info_hash).await {
             engine.touch();
+            is_multifile = engine.handle.file_count().await > 1;
 
-            // Restore full upload the moment any stream begins. While seeding is
-            // off, a finished idle torrent has its upload clamped to a trickle;
-            // a starting stream means the user is watching/about-to-download, so
-            // we want full tit-for-tat speed back. Because the torrent was only
-            // throttled (never paused), its peers are still connected, so the
-            // new file downloads immediately -- no swarm re-acquisition needed.
-            if engine.upload_throttled.swap(false, Ordering::Relaxed) {
-                if let Err(err) = engine.handle.set_upload_throttled(false).await {
-                    tracing::warn!(
-                        info_hash = %info_hash,
-                        file_idx,
-                        error = %err,
-                        source,
-                        "Failed to restore torrent upload for active stream"
-                    );
-                    engine.upload_throttled.store(true, Ordering::Relaxed);
-                }
-            }
-
-            // Resume any torrent that is still paused. We no longer pause for
-            // seeding (we throttle instead), but a torrent may have been paused
-            // by an older build or by libtorrent state, and a stream cannot make
-            // progress while paused.
+            // Any new playback activity must resume a torrent that was paused
+            // by the idle seeding-disabled policy.
             if let Err(err) = engine.handle.resume_torrent().await {
                 tracing::warn!(
                     info_hash = %info_hash,
@@ -682,18 +733,26 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     source,
                     "Failed to resume torrent for active stream"
                 );
+            } else if engine.idle_paused.swap(false, Ordering::Relaxed) {
+                tracing::info!(
+                    info_hash = %info_hash,
+                    file_idx,
+                    source,
+                    "torrent_resumed_for_stream"
+                );
             }
 
-            if keep_file_downloading {
-                if let Err(err) = engine.handle.keep_file_downloading(file_idx).await {
-                    tracing::warn!(
-                        info_hash = %info_hash,
-                        file_idx,
-                        error = %err,
-                        source,
-                        "Failed to keep HLS playback file downloading"
-                    );
-                }
+            if keep_file_downloading
+                && !is_multifile
+                && let Err(err) = engine.handle.keep_file_downloading(file_idx).await
+            {
+                tracing::warn!(
+                    info_hash = %info_hash,
+                    file_idx,
+                    error = %err,
+                    source,
+                    "Failed to keep HLS playback file downloading"
+                );
             }
         }
 
@@ -701,6 +760,128 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
             let mut active = self.active_file.write().await;
             *active = Some((info_hash.to_string(), file_idx));
         }
+
+        if is_multifile {
+            self.activate_multifile_file(info_hash, file_idx, None, source)
+                .await;
+        }
+    }
+
+    pub async fn activate_multifile_file_for_playback(
+        &self,
+        info_hash: &str,
+        file_idx: usize,
+        hot_file: Option<HotFilePriorityPlan>,
+        source: &'static str,
+    ) {
+        let info_hash = info_hash.to_lowercase();
+        self.activate_multifile_file(&info_hash, file_idx, hot_file, source)
+            .await;
+    }
+
+    async fn activate_multifile_file(
+        &self,
+        info_hash: &str,
+        file_idx: usize,
+        hot_file: Option<HotFilePriorityPlan>,
+        source: &'static str,
+    ) {
+        let Some(engine) = self.get_engine(info_hash).await else {
+            return;
+        };
+
+        if engine.handle.file_count().await <= 1 {
+            return;
+        }
+
+        let generation = self.priority_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let now = now_secs();
+        let previous_file_idx = {
+            let mut selections = self.active_multifile_files.write().await;
+            selections
+                .insert(
+                    info_hash.to_string(),
+                    MultiFileActiveSelection {
+                        file_idx,
+                        generation,
+                        source,
+                        last_seen_secs: now,
+                    },
+                )
+                .map(|selection| selection.file_idx)
+        };
+
+        {
+            let mut leases = self.active_playback_leases.write().await;
+            leases.retain(|(hash, idx), _| hash.as_str() != info_hash || *idx == file_idx);
+        }
+        {
+            let mut streams = self.active_file_streams.write().await;
+            streams.retain(|(hash, idx), _| hash.as_str() != info_hash || *idx == file_idx);
+        }
+        {
+            let mut active = self.active_file.write().await;
+            *active = Some((info_hash.to_string(), file_idx));
+        }
+
+        engine.touch();
+        if let Err(err) = engine.handle.resume_torrent().await {
+            tracing::warn!(
+                info_hash = %info_hash,
+                file_idx,
+                generation,
+                error = %err,
+                source,
+                "Failed to resume torrent for multi-file active file"
+            );
+        } else {
+            engine.idle_paused.store(false, Ordering::Relaxed);
+        }
+
+        Self::reconcile_multifile_engine(engine, Some(file_idx), hot_file, generation, source)
+            .await;
+
+        tracing::info!(
+            info_hash = %info_hash,
+            file_idx,
+            previous_file_idx,
+            generation,
+            source,
+            "multifile_active_file_selected"
+        );
+    }
+
+    async fn reconcile_multifile_engine(
+        engine: Arc<Engine<B::Handle>>,
+        active_file: Option<usize>,
+        hot_file: Option<HotFilePriorityPlan>,
+        generation: u64,
+        reason: &'static str,
+    ) -> bool {
+        if engine.handle.file_count().await <= 1 {
+            return false;
+        }
+
+        if let Err(err) = engine
+            .handle
+            .reconcile_file_priorities(TorrentFilePriorityPlan {
+                active_file,
+                hot_file,
+                generation,
+                reason,
+            })
+            .await
+        {
+            tracing::warn!(
+                info_hash = %engine.info_hash,
+                generation,
+                reason,
+                error = %err,
+                "Failed to reconcile multi-file priorities"
+            );
+        }
+
+        true
     }
 
     /// Refresh an HLS playback lease. HLS segment reads are short-lived, so this
@@ -791,7 +972,8 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 reason,
                 "HLS playback lease ended"
             );
-            self.schedule_file_cleanup(info_hash.clone(), file_idx);
+            self.schedule_file_cleanup(info_hash.clone(), file_idx)
+                .await;
             self.schedule_torrent_pause(info_hash);
         }
     }
@@ -842,7 +1024,8 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         }
 
         if file_streams_remaining == 0 {
-            self.schedule_file_cleanup(info_hash.clone(), file_idx);
+            self.schedule_file_cleanup(info_hash.clone(), file_idx)
+                .await;
         }
 
         let remaining = self.active_streams.read().await.values().sum::<usize>();
@@ -855,21 +1038,24 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
         );
     }
 
-    /// Promptly throttle seeding shortly after the last stream on a torrent
-    /// ends (the periodic loop is the slower backstop). Never pauses -- pausing
-    /// disconnects peers and breaks the next episode's download.
+    /// Promptly pause an idle torrent shortly after the last stream on it ends
+    /// when seeding is disabled. A later playback request resumes it before
+    /// selecting the requested file.
     fn schedule_torrent_pause(&self, info_hash: String) {
+        self.schedule_torrent_pause_after(info_hash, INACTIVE_TORRENT_PAUSE_GRACE);
+    }
+
+    fn schedule_torrent_pause_after(&self, info_hash: String, delay: Duration) {
         let engines = self.engines.clone();
         let active_streams = self.active_streams.clone();
         let active_file_streams = self.active_file_streams.clone();
         let active_playback_leases = self.active_playback_leases.clone();
+        let active_multifile_files = self.active_multifile_files.clone();
         let seeding_enabled = self.seeding_enabled.clone();
 
         tokio::spawn(async move {
-            tokio::time::sleep(INACTIVE_TORRENT_PAUSE_GRACE).await;
+            tokio::time::sleep(delay).await;
 
-            // Throttling only matters for the seeding-disabled policy. When
-            // seeding is enabled we never clamp upload.
             if seeding_enabled.load(Ordering::Relaxed) {
                 return;
             }
@@ -891,13 +1077,18 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     hash == &info_hash && playback_lease_is_active(lease, now)
                 })
             };
-            if hash_active || file_active || playback_active {
+            let multifile_active = {
+                let selections = active_multifile_files.read().await;
+                selections.contains_key(&info_hash)
+            };
+            if hash_active || file_active || playback_active || multifile_active {
                 tracing::debug!(
                     info_hash = %info_hash,
                     hash_active,
                     file_active,
                     playback_active,
-                    "Skipping seeding throttle because stream activity resumed"
+                    multifile_active,
+                    "Skipping idle pause because stream activity resumed"
                 );
                 return;
             }
@@ -907,36 +1098,55 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 engines.get(&info_hash).cloned()
             };
             if let Some(engine) = engine {
-                engine.touch();
-                // Only throttle a FINISHED torrent (purely seeding). One still
-                // downloading must keep full upload for tit-for-tat speed.
-                if !engine.handle.is_finished().await {
+                let reader_active = engine.active_streams.load(Ordering::SeqCst) > 0;
+                if reader_active {
+                    tracing::debug!(
+                        info_hash = %info_hash,
+                        reader_active,
+                        "Skipping idle pause because a file or metadata reader is active"
+                    );
                     return;
                 }
-                if engine.upload_throttled.swap(true, Ordering::Relaxed) {
+                if !engine.handle.stats().await.has_metadata {
+                    tracing::debug!(
+                        info_hash = %info_hash,
+                        "Skipping idle pause while torrent metadata is unresolved"
+                    );
+                    return;
+                }
+                engine.touch();
+                if engine.idle_paused.swap(true, Ordering::Relaxed) {
                     return;
                 }
                 tracing::info!(
                     info_hash = %info_hash,
-                    "Throttling seeding on inactive finished torrent (seeding disabled)"
+                    "torrent_paused_idle"
                 );
-                if let Err(err) = engine.handle.set_upload_throttled(true).await {
+                if let Err(err) = engine.handle.pause_torrent().await {
                     tracing::warn!(
                         info_hash = %info_hash,
                         error = %err,
-                        "Failed to throttle inactive torrent upload after grace period"
+                        "Failed to pause inactive torrent after grace period"
                     );
-                    engine.upload_throttled.store(false, Ordering::Relaxed);
+                    engine.idle_paused.store(false, Ordering::Relaxed);
                 }
             }
         });
     }
 
-    fn schedule_file_cleanup(&self, info_hash: String, file_idx: usize) {
+    async fn schedule_file_cleanup(&self, info_hash: String, file_idx: usize) {
         let engines = self.engines.clone();
         let active_file = self.active_file.clone();
         let active_file_streams = self.active_file_streams.clone();
         let active_playback_leases = self.active_playback_leases.clone();
+        let active_multifile_files = self.active_multifile_files.clone();
+        let scheduled_generation = {
+            let selections = self.active_multifile_files.read().await;
+            selections
+                .get(&info_hash)
+                .filter(|selection| selection.file_idx == file_idx)
+                .map(|selection| selection.generation)
+        };
 
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(5)).await;
@@ -971,17 +1181,50 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 return;
             }
 
+            let active_selection = {
+                let mut selections = active_multifile_files.write().await;
+                match selections.get(&info_hash).cloned() {
+                    Some(selection) if selection.file_idx == file_idx => {
+                        if scheduled_generation == Some(selection.generation) {
+                            selections.remove(&info_hash);
+                            tracing::info!(
+                                info_hash = %info_hash,
+                                file_idx,
+                                generation = selection.generation,
+                                reason = "delayed-cleanup",
+                                "multifile_active_file_cleared"
+                            );
+                            None
+                        } else {
+                            tracing::debug!(
+                                info_hash = %info_hash,
+                                file_idx,
+                                scheduled_generation,
+                                active_generation = selection.generation,
+                                "Skipping delayed cleanup because multi-file selection is newer"
+                            );
+                            return;
+                        }
+                    }
+                    Some(selection) => Some(selection),
+                    None => None,
+                }
+            };
+
             {
                 let mut active = active_file.write().await;
-                if let Some((ref h, idx)) = *active {
-                    if h == &info_hash && idx == file_idx {
-                        tracing::info!(
-                            "Delayed cleanup: clearing active file for {} file_idx={}",
-                            info_hash,
-                            file_idx
-                        );
-                        *active = None;
-                    }
+                if let Some((ref h, idx)) = *active
+                    && h == &info_hash
+                    && idx == file_idx
+                {
+                    tracing::info!(
+                        "Delayed cleanup: clearing active file for {} file_idx={}",
+                        info_hash,
+                        file_idx
+                    );
+                    *active = active_selection
+                        .as_ref()
+                        .map(|selection| (info_hash.clone(), selection.file_idx));
                 }
             }
 
@@ -990,6 +1233,30 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 engines.get(&info_hash).cloned()
             };
             if let Some(engine) = engine {
+                let reconciled = Self::reconcile_multifile_engine(
+                    engine.clone(),
+                    active_selection
+                        .as_ref()
+                        .map(|selection| selection.file_idx),
+                    None,
+                    active_selection
+                        .as_ref()
+                        .map(|selection| selection.generation)
+                        .or(scheduled_generation)
+                        .unwrap_or(0),
+                    "delayed-cleanup",
+                )
+                .await;
+                if reconciled {
+                    tracing::info!(
+                        info_hash = %info_hash,
+                        file_idx,
+                        active_file = active_selection.as_ref().map(|selection| selection.file_idx),
+                        "Delayed cleanup: reconciled multi-file priorities"
+                    );
+                    return;
+                }
+
                 if let Err(e) = engine.handle.clear_file_streaming(file_idx).await {
                     tracing::warn!(
                         "Failed to clear file priorities for {} idx={}: {}",
@@ -1019,9 +1286,10 @@ mod tests {
     use super::*;
     use crate::backend::{
         BackendFileInfo, EngineStats, FileStreamTrait, Growler, PeerSearch, PieceReadiness,
-        StatsFile, StatsOptions, SwarmCap,
+        StatsFile, StatsOptions, SwarmCap, TorrentFilePriorityPlan,
     };
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     const TEST_HASH: &str = "0123456789abcdef0123456789abcdef01234567";
 
@@ -1030,12 +1298,17 @@ mod tests {
         keep_file_downloading: AtomicUsize,
         clear_file_streaming: AtomicUsize,
         resume_torrent: AtomicUsize,
+        pause_torrent: AtomicUsize,
+        reconcile_file_priorities: AtomicUsize,
+        last_active_file: Mutex<Option<usize>>,
+        last_generation: AtomicU64,
     }
 
     #[derive(Clone)]
     struct FakeHandle {
         info_hash: String,
         counters: Arc<FakeCounters>,
+        file_count: usize,
     }
 
     struct FakeBackend {
@@ -1082,17 +1355,20 @@ mod tests {
         }
 
         async fn stats(&self) -> EngineStats {
+            let files = (0..self.file_count)
+                .map(|idx| StatsFile {
+                    name: format!("video-{idx}.mkv"),
+                    path: format!("video-{idx}.mkv"),
+                    length: 100,
+                    offset: idx as u64 * 100,
+                    downloaded: 50,
+                    progress: 0.5,
+                })
+                .collect();
             EngineStats {
                 name: "fake".to_string(),
                 info_hash: self.info_hash.clone(),
-                files: vec![StatsFile {
-                    name: "video.mkv".to_string(),
-                    path: "video.mkv".to_string(),
-                    length: 100,
-                    offset: 0,
-                    downloaded: 50,
-                    progress: 0.5,
-                }],
+                files,
                 sources: vec![],
                 opts: StatsOptions {
                     connections: None,
@@ -1123,7 +1399,7 @@ mod tests {
                 swarm_paused: false,
                 swarm_size: 0,
                 is_finished: false,
-                has_metadata: true,
+                has_metadata: self.file_count > 0,
             }
         }
 
@@ -1136,10 +1412,26 @@ mod tests {
             Ok(())
         }
 
+        async fn pause_torrent(&self) -> Result<()> {
+            self.counters.pause_torrent.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
         async fn keep_file_downloading(&self, _file_idx: usize) -> Result<()> {
             self.counters
                 .keep_file_downloading
                 .fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn reconcile_file_priorities(&self, plan: TorrentFilePriorityPlan) -> Result<()> {
+            self.counters
+                .reconcile_file_priorities
+                .fetch_add(1, Ordering::SeqCst);
+            *self.counters.last_active_file.lock().unwrap() = plan.active_file;
+            self.counters
+                .last_generation
+                .store(plan.generation, Ordering::SeqCst);
             Ok(())
         }
 
@@ -1155,10 +1447,12 @@ mod tests {
         }
 
         async fn get_files(&self) -> Vec<BackendFileInfo> {
-            vec![BackendFileInfo {
-                name: "video.mkv".to_string(),
-                length: 100,
-            }]
+            (0..self.file_count)
+                .map(|idx| BackendFileInfo {
+                    name: format!("video-{idx}.mkv"),
+                    length: 100,
+                })
+                .collect()
         }
 
         async fn get_file_path(&self, _file_idx: usize) -> Option<String> {
@@ -1197,10 +1491,17 @@ mod tests {
     }
 
     fn test_enginefs() -> (BackendEngineFS<FakeBackend>, Arc<FakeCounters>) {
+        test_enginefs_with_file_count(1)
+    }
+
+    fn test_enginefs_with_file_count(
+        file_count: usize,
+    ) -> (BackendEngineFS<FakeBackend>, Arc<FakeCounters>) {
         let counters = Arc::new(FakeCounters::default());
         let handle = FakeHandle {
             info_hash: TEST_HASH.to_string(),
             counters: counters.clone(),
+            file_count,
         };
         let mut restored = HashMap::new();
         restored.insert(TEST_HASH.to_string(), handle.clone());
@@ -1247,11 +1548,183 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multi_file_selects_only_requested_file() {
+        let (enginefs, counters) = test_enginefs_with_file_count(3);
+
+        enginefs.on_stream_start(TEST_HASH, 1).await;
+
+        let snapshot = enginefs.stream_activity_snapshot().await;
+        assert_eq!(snapshot.active_multifile_selections.len(), 1);
+        assert_eq!(snapshot.active_multifile_selections[0].file_idx, 1);
+        assert_eq!(*counters.last_active_file.lock().unwrap(), Some(1));
+        assert_eq!(counters.keep_file_downloading.load(Ordering::SeqCst), 0);
+        assert_eq!(counters.reconcile_file_priorities.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn multi_file_latest_request_wins() {
+        let (enginefs, counters) = test_enginefs_with_file_count(3);
+
+        enginefs.on_stream_start(TEST_HASH, 1).await;
+        enginefs.on_stream_start(TEST_HASH, 2).await;
+
+        let snapshot = enginefs.stream_activity_snapshot().await;
+        assert_eq!(snapshot.active_multifile_selections.len(), 1);
+        assert_eq!(snapshot.active_multifile_selections[0].file_idx, 2);
+        assert_eq!(*counters.last_active_file.lock().unwrap(), Some(2));
+        assert!(
+            snapshot
+                .active_file_streams
+                .iter()
+                .all(|stream| stream.file_idx == 2)
+        );
+        assert_eq!(counters.reconcile_file_priorities.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn hls_lease_switch_removes_sibling_lease() {
+        let (enginefs, _counters) = test_enginefs_with_file_count(3);
+
+        enginefs.refresh_hls_playback(TEST_HASH, 1, "test").await;
+        enginefs.refresh_hls_playback(TEST_HASH, 2, "test").await;
+
+        let snapshot = enginefs.stream_activity_snapshot().await;
+        assert_eq!(snapshot.active_playback_leases.len(), 1);
+        assert_eq!(snapshot.active_playback_leases[0].file_idx, 2);
+        assert_eq!(snapshot.active_multifile_selections.len(), 1);
+        assert_eq!(snapshot.active_multifile_selections[0].file_idx, 2);
+    }
+
+    #[tokio::test]
+    async fn stats_cannot_switch_active_multifile_file() {
+        let (enginefs, _counters) = test_enginefs_with_file_count(3);
+
+        enginefs.refresh_hls_playback(TEST_HASH, 1, "test").await;
+        let refreshed = enginefs
+            .refresh_existing_hls_playback(TEST_HASH, 2, "stats-json")
+            .await;
+
+        let snapshot = enginefs.stream_activity_snapshot().await;
+        assert!(!refreshed);
+        assert_eq!(snapshot.active_multifile_selections.len(), 1);
+        assert_eq!(snapshot.active_multifile_selections[0].file_idx, 1);
+        assert_eq!(snapshot.active_playback_leases.len(), 1);
+        assert_eq!(snapshot.active_playback_leases[0].file_idx, 1);
+    }
+
+    #[tokio::test]
+    async fn stats_refreshes_current_multifile_file() {
+        let (enginefs, _counters) = test_enginefs_with_file_count(3);
+
+        enginefs.refresh_hls_playback(TEST_HASH, 1, "test").await;
+        let refreshed = enginefs
+            .refresh_existing_hls_playback(TEST_HASH, 1, "stats-json")
+            .await;
+
+        let snapshot = enginefs.stream_activity_snapshot().await;
+        assert!(refreshed);
+        assert_eq!(snapshot.active_multifile_selections.len(), 1);
+        assert_eq!(snapshot.active_multifile_selections[0].file_idx, 1);
+        assert_eq!(snapshot.active_playback_leases.len(), 1);
+        assert_eq!(snapshot.active_playback_leases[0].file_idx, 1);
+    }
+
+    #[tokio::test]
+    async fn old_cleanup_cannot_clear_newer_multifile_active_file() {
+        let (enginefs, counters) = test_enginefs_with_file_count(3);
+
+        enginefs.refresh_hls_playback(TEST_HASH, 1, "test").await;
+        enginefs
+            .schedule_file_cleanup(TEST_HASH.to_string(), 1)
+            .await;
+        enginefs.refresh_hls_playback(TEST_HASH, 2, "test").await;
+        tokio::time::sleep(Duration::from_secs(6)).await;
+
+        let snapshot = enginefs.stream_activity_snapshot().await;
+        assert_eq!(snapshot.active_multifile_selections.len(), 1);
+        assert_eq!(snapshot.active_multifile_selections[0].file_idx, 2);
+        assert_eq!(*counters.last_active_file.lock().unwrap(), Some(2));
+        assert_eq!(counters.clear_file_streaming.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn paused_torrent_resumes_for_requested_multifile_file() {
+        let (enginefs, counters) = test_enginefs_with_file_count(3);
+        {
+            let engine = enginefs.get_engine(TEST_HASH).await.unwrap();
+            engine.idle_paused.store(true, Ordering::Relaxed);
+        }
+
+        enginefs.on_stream_start(TEST_HASH, 2).await;
+
+        let snapshot = enginefs.stream_activity_snapshot().await;
+        assert_eq!(snapshot.active_multifile_selections.len(), 1);
+        assert_eq!(snapshot.active_multifile_selections[0].file_idx, 2);
+        assert_eq!(*counters.last_active_file.lock().unwrap(), Some(2));
+        assert!(
+            counters.resume_torrent.load(Ordering::SeqCst) > 0,
+            "request should resume an idle-paused torrent"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_pause_skips_active_multifile_selection() {
+        let (enginefs, counters) = test_enginefs_with_file_count(3);
+        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
+
+        enginefs.on_stream_start(TEST_HASH, 1).await;
+        {
+            enginefs.active_streams.write().await.clear();
+            enginefs.active_file_streams.write().await.clear();
+        }
+        enginefs.schedule_torrent_pause_after(TEST_HASH.to_string(), Duration::from_millis(10));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(counters.pause_torrent.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn idle_pause_runs_when_no_activity_remains() {
+        let (enginefs, counters) = test_enginefs_with_file_count(3);
+        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
+
+        enginefs.schedule_torrent_pause_after(TEST_HASH.to_string(), Duration::from_millis(10));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(counters.pause_torrent.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn idle_pause_skips_torrent_awaiting_metadata() {
+        let (enginefs, counters) = test_enginefs_with_file_count(0);
+        enginefs.seeding_enabled.store(false, Ordering::Relaxed);
+
+        enginefs.schedule_torrent_pause_after(TEST_HASH.to_string(), Duration::from_millis(10));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(counters.pause_torrent.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn single_file_bypasses_multifile_selector() {
+        let (enginefs, counters) = test_enginefs();
+
+        enginefs.on_stream_start(TEST_HASH, 0).await;
+
+        let snapshot = enginefs.stream_activity_snapshot().await;
+        assert!(snapshot.active_multifile_selections.is_empty());
+        assert_eq!(counters.reconcile_file_priorities.load(Ordering::SeqCst), 0);
+        assert_eq!(counters.keep_file_downloading.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn active_hls_lease_prevents_delayed_cleanup() {
         let (enginefs, counters) = test_enginefs();
 
         enginefs.refresh_hls_playback(TEST_HASH, 0, "test").await;
-        enginefs.schedule_file_cleanup(TEST_HASH.to_string(), 0);
+        enginefs
+            .schedule_file_cleanup(TEST_HASH.to_string(), 0)
+            .await;
         tokio::time::sleep(Duration::from_secs(6)).await;
 
         assert_eq!(counters.clear_file_streaming.load(Ordering::SeqCst), 0);
@@ -1269,7 +1742,9 @@ mod tests {
                 .unwrap()
                 .expires_at_secs = now_secs();
         }
-        enginefs.schedule_file_cleanup(TEST_HASH.to_string(), 0);
+        enginefs
+            .schedule_file_cleanup(TEST_HASH.to_string(), 0)
+            .await;
         tokio::time::sleep(Duration::from_secs(6)).await;
 
         assert_eq!(counters.clear_file_streaming.load(Ordering::SeqCst), 1);
@@ -1366,23 +1841,22 @@ impl BackendEngineFS<LibtorrentBackend> {
         self.seeding_enabled.store(enabled, Ordering::Relaxed);
         tracing::info!(seeding_enabled = enabled, "Seeding policy updated");
 
-        // When seeding is turned back on, lift the upload throttle from any
-        // torrent the seeding-disabled policy had clamped, so it can seed at
-        // full speed again. (Turning seeding off is handled lazily by the
-        // periodic loop / schedule_torrent_pause.)
+        // When seeding is turned back on, resume torrents the seeding-disabled
+        // policy had paused so they can seed again. Turning seeding off is
+        // handled lazily by the periodic loop / schedule_torrent_pause.
         if enabled {
             let engines = self.engines.clone();
             tokio::spawn(async move {
                 let read = engines.read().await;
                 for engine in read.values() {
-                    if engine.upload_throttled.swap(false, Ordering::Relaxed) {
-                        if let Err(err) = engine.handle.set_upload_throttled(false).await {
+                    if engine.idle_paused.swap(false, Ordering::Relaxed) {
+                        if let Err(err) = engine.handle.resume_torrent().await {
                             tracing::warn!(
                                 info_hash = %engine.info_hash,
                                 error = %err,
-                                "Failed to restore torrent upload after re-enabling seeding"
+                                "Failed to resume torrent after re-enabling seeding"
                             );
-                            engine.upload_throttled.store(true, Ordering::Relaxed);
+                            engine.idle_paused.store(true, Ordering::Relaxed);
                         }
                     }
                 }

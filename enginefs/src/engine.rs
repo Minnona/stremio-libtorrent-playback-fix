@@ -26,11 +26,9 @@ pub struct Engine<H: TorrentHandle> {
     pub active_streams: Arc<AtomicUsize>,
     pub probe_cache: Mutex<HashMap<usize, crate::hls::ProbeResult>>,
     pub data_cache: DataCache,
-    /// Whether this torrent's upload is currently clamped to a trickle because
-    /// it finished while seeding is disabled. Tracked so the seeding-control
-    /// loop only flips (and logs) the throttle on real state changes, and so a
-    /// starting stream knows to restore full upload.
-    pub upload_throttled: AtomicBool,
+    /// Whether this torrent was paused by the idle seeding-disabled policy.
+    /// A new playback request resumes it before making a file wanted.
+    pub idle_paused: AtomicBool,
 }
 
 impl<H: TorrentHandle> Engine<H> {
@@ -45,7 +43,7 @@ impl<H: TorrentHandle> Engine<H> {
                 .weigher(|_key, value: &Arc<Vec<u8>>| value.len() as u32)
                 .max_capacity(64 * 1024 * 1024) // 64MB cache per engine
                 .build(),
-            upload_throttled: AtomicBool::new(false),
+            idle_paused: AtomicBool::new(false),
         }
     }
 
