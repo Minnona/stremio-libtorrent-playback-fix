@@ -1042,10 +1042,15 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     /// when seeding is disabled. A later playback request resumes it before
     /// selecting the requested file.
     fn schedule_torrent_pause(&self, info_hash: String) {
-        self.schedule_torrent_pause_after(info_hash, INACTIVE_TORRENT_PAUSE_GRACE);
+        // Dropping a Tokio JoinHandle detaches the task instead of cancelling it.
+        drop(self.schedule_torrent_pause_after(info_hash, INACTIVE_TORRENT_PAUSE_GRACE));
     }
 
-    fn schedule_torrent_pause_after(&self, info_hash: String, delay: Duration) {
+    fn schedule_torrent_pause_after(
+        &self,
+        info_hash: String,
+        delay: Duration,
+    ) -> tokio::task::JoinHandle<()> {
         let engines = self.engines.clone();
         let active_streams = self.active_streams.clone();
         let active_file_streams = self.active_file_streams.clone();
@@ -1131,7 +1136,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     engine.idle_paused.store(false, Ordering::Relaxed);
                 }
             }
-        });
+        })
     }
 
     async fn schedule_file_cleanup(&self, info_hash: String, file_idx: usize) {
@@ -1677,8 +1682,10 @@ mod tests {
             enginefs.active_streams.write().await.clear();
             enginefs.active_file_streams.write().await.clear();
         }
-        enginefs.schedule_torrent_pause_after(TEST_HASH.to_string(), Duration::from_millis(10));
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        enginefs
+            .schedule_torrent_pause_after(TEST_HASH.to_string(), Duration::from_millis(10))
+            .await
+            .unwrap();
 
         assert_eq!(counters.pause_torrent.load(Ordering::SeqCst), 0);
     }
@@ -1688,8 +1695,10 @@ mod tests {
         let (enginefs, counters) = test_enginefs_with_file_count(3);
         enginefs.seeding_enabled.store(false, Ordering::Relaxed);
 
-        enginefs.schedule_torrent_pause_after(TEST_HASH.to_string(), Duration::from_millis(10));
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        enginefs
+            .schedule_torrent_pause_after(TEST_HASH.to_string(), Duration::from_millis(10))
+            .await
+            .unwrap();
 
         assert_eq!(counters.pause_torrent.load(Ordering::SeqCst), 1);
     }
@@ -1699,8 +1708,10 @@ mod tests {
         let (enginefs, counters) = test_enginefs_with_file_count(0);
         enginefs.seeding_enabled.store(false, Ordering::Relaxed);
 
-        enginefs.schedule_torrent_pause_after(TEST_HASH.to_string(), Duration::from_millis(10));
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        enginefs
+            .schedule_torrent_pause_after(TEST_HASH.to_string(), Duration::from_millis(10))
+            .await
+            .unwrap();
 
         assert_eq!(counters.pause_torrent.load(Ordering::SeqCst), 0);
     }
