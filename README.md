@@ -22,6 +22,7 @@ Stream Server is a **fully open-source** replacement for Stremio's proprietary `
 
 ### Projects using Stream Server
 
+* **[stremio-native](https://github.com/perpetus/stremio-native)**: The recommended way to use Stream Server as a complete desktop application. It integrates the server directly with a native Stremio client and player. **Stremio Native is still in the early stages of development, so expect incomplete features and breaking changes.**
 * **[stremio-android](https://github.com/perpetus/stremio-android)**: A native Kotlin/Compose Stremio client app for Android that integrates `stream-server` as a local JNI library/service for high-performance torrent streaming.
 
 ---
