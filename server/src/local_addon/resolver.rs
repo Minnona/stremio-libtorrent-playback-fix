@@ -30,36 +30,32 @@ pub async fn resolve_imdb(
 
     // IMDB returns JSONP, e.g., imdb$frozen({"d": ...})
     // We need to strip the callback wrapper
-    match client.get(&url).send().await {
-        Ok(resp) => {
-            if let Ok(text) = resp.text().await {
-                if let Some(start) = text.find("({") {
-                    let end = text.rfind("})").unwrap_or(text.len());
-                    if start + 1 < end + 1 {
-                        let json_part = &text[start + 1..end + 1];
-                        if let Ok(result) = serde_json::from_str::<ImdbResult>(json_part) {
-                            if let Some(nodes) = result.d {
-                                // Simple matching logic
-                                for node in nodes {
-                                    if let Some(node_year) = node.y {
-                                        if let Some(target_year) = year {
-                                            if (node_year - target_year).abs() <= 1 {
-                                                return Some(node.id);
-                                            }
-                                        } else {
-                                            // If no year specified, return first match?
-                                            // Ideally we want to be stricter
-                                            return Some(node.id);
-                                        }
-                                    }
-                                }
+    if let Ok(resp) = client.get(&url).send().await
+        && let Ok(text) = resp.text().await
+        && let Some(start) = text.find("({")
+    {
+        let end = text.rfind("})").unwrap_or(text.len());
+        if start + 1 < end + 1 {
+            let json_part = &text[start + 1..end + 1];
+            if let Ok(result) = serde_json::from_str::<ImdbResult>(json_part)
+                && let Some(nodes) = result.d
+            {
+                // Simple matching logic
+                for node in nodes {
+                    if let Some(node_year) = node.y {
+                        if let Some(target_year) = year {
+                            if (node_year - target_year).abs() <= 1 {
+                                return Some(node.id);
                             }
+                        } else {
+                            // If no year specified, return first match?
+                            // Ideally we want to be stricter
+                            return Some(node.id);
                         }
                     }
                 }
             }
         }
-        Err(_) => {}
     }
     None
 }

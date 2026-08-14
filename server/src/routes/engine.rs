@@ -199,10 +199,10 @@ where
         })
         .collect::<Vec<_>>();
 
-    if let Ok(idx) = compat::resolve_file_idx("-1", &candidates, filters) {
-        if let Some(obj) = value.as_object_mut() {
-            obj.insert("guessedFileIdx".to_string(), json!(idx));
-        }
+    if let Ok(idx) = compat::resolve_file_idx("-1", &candidates, filters)
+        && let Some(obj) = value.as_object_mut()
+    {
+        obj.insert("guessedFileIdx".to_string(), json!(idx));
     }
 
     value

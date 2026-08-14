@@ -1,17 +1,38 @@
-use std::io::{Read, Seek};
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use crate::backend::priorities::{
-    BLOCKED_REPLAN_INTERVAL_MS, PlaybackIntent, disk_backed_file_baseline_priority,
-    disk_backed_forward_window_pieces_for, disk_backed_sequential_download,
+    BLOCKED_REPLAN_INTERVAL_MS, PlaybackIntent, disk_backed_forward_window_pieces_for,
 };
 use crate::metadata_pins::MetadataPinRegistry;
 use crate::piece_waiter::PieceWaiterRegistry;
 
 const INITIAL_FIRST_BYTE_WINDOW_PIECES: i32 = 3;
-const URGENT_REASSERT_INTERVAL_MS: u64 = 250;
+const URGENT_REASSERT_INTERVAL_MS: u64 = 8_000;
+type PieceReadTask = tokio::task::JoinHandle<std::io::Result<Arc<Vec<u8>>>>;
+
+fn broker_slice_bounds(
+    piece: i32,
+    piece_length: u64,
+    file_offset: u64,
+    current_pos: u64,
+    file_size: u64,
+    piece_bytes: usize,
+    requested_bytes: usize,
+) -> Option<(usize, usize)> {
+    let piece_start = (piece.max(0) as u64).saturating_mul(piece_length);
+    let global_position = file_offset.saturating_add(current_pos);
+    let offset = usize::try_from(global_position.saturating_sub(piece_start)).ok()?;
+    let available = piece_bytes.saturating_sub(offset);
+    let remaining_file =
+        usize::try_from(file_size.saturating_sub(current_pos)).unwrap_or(usize::MAX);
+    let len = requested_bytes.min(available).min(remaining_file);
+    (len != 0).then_some((offset, offset + len))
+}
 
 pub(crate) struct LibtorrentDiskFileStream {
     handle: libtorrent_sys::LibtorrentHandle,
@@ -27,19 +48,27 @@ pub(crate) struct LibtorrentDiskFileStream {
     current_pos: u64,
     stream_id: usize,
     playback_intent: PlaybackIntent,
-    multi_file_mode: bool,
     piece_waiter: Arc<PieceWaiterRegistry>,
     metadata_pins: Arc<MetadataPinRegistry>,
     created_at: Instant,
     first_read_logged: bool,
-    last_retry_wake: Instant,
     last_wait_log: Instant,
     last_prioritized_piece: i32,
     consecutive_waits: u32,
     last_blocked_replan: Instant,
-    last_stall_reannounce: Instant,
     last_urgent_reassert: Instant,
     urgent_reassert_count: u32,
+    file: Option<tokio::fs::File>,
+    file_cursor: u64,
+    seek_pending: bool,
+    open_file: Option<tokio::task::JoinHandle<std::io::Result<tokio::fs::File>>>,
+    scratch: Vec<u8>,
+    broker_piece: Option<(i32, Arc<Vec<u8>>)>,
+    piece_read: Option<(i32, PieceReadTask)>,
+    piece_read_retry_at: Option<(i32, Instant)>,
+    retry_sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+    alert_hub: Arc<super::alerts::LibtorrentAlertHub>,
+    playback_permit: super::playback::LibtorrentPlaybackPermit,
 }
 
 impl LibtorrentDiskFileStream {
@@ -59,14 +88,10 @@ impl LibtorrentDiskFileStream {
         playback_intent: PlaybackIntent,
         piece_waiter: Arc<PieceWaiterRegistry>,
         metadata_pins: Arc<MetadataPinRegistry>,
-        multi_file_mode: bool,
+        file: Option<tokio::fs::File>,
+        alert_hub: Arc<super::alerts::LibtorrentAlertHub>,
+        playback_permit: super::playback::LibtorrentPlaybackPermit,
     ) -> Self {
-        let mut handle = handle;
-        // Pieces verified moments ago (e.g. the shared boundary piece of the
-        // previous episode) may still be in libtorrent's write cache; start a
-        // flush so direct file reads see real bytes instead of preallocated
-        // zeros.
-        handle.flush_cache();
         Self {
             handle,
             info_hash,
@@ -81,25 +106,31 @@ impl LibtorrentDiskFileStream {
             current_pos: 0,
             stream_id,
             playback_intent,
-            multi_file_mode,
             piece_waiter,
             metadata_pins,
             created_at: Instant::now(),
             first_read_logged: false,
-            last_retry_wake: Instant::now(),
             last_wait_log: Instant::now()
                 .checked_sub(Duration::from_secs(5))
                 .unwrap_or_else(Instant::now),
             last_prioritized_piece: -1,
             consecutive_waits: 0,
-            last_blocked_replan: Instant::now()
-                .checked_sub(Duration::from_millis(BLOCKED_REPLAN_INTERVAL_MS))
-                .unwrap_or_else(Instant::now),
-            last_stall_reannounce: Instant::now(),
+            last_blocked_replan: Instant::now(),
             last_urgent_reassert: Instant::now()
                 .checked_sub(Duration::from_millis(URGENT_REASSERT_INTERVAL_MS))
                 .unwrap_or_else(Instant::now),
             urgent_reassert_count: 0,
+            file,
+            file_cursor: 0,
+            seek_pending: false,
+            open_file: None,
+            scratch: vec![0; 256 * 1024],
+            broker_piece: None,
+            piece_read: None,
+            piece_read_retry_at: None,
+            retry_sleep: None,
+            alert_hub,
+            playback_permit,
         }
     }
 
@@ -149,6 +180,14 @@ impl LibtorrentDiskFileStream {
         }
     }
 
+    fn is_background_reader(&self) -> bool {
+        self.playback_permit.is_subordinate()
+            || matches!(
+                self.playback_intent,
+                PlaybackIntent::InternalProbe | PlaybackIntent::Background
+            )
+    }
+
     /// Pinned metadata (Cues/moov) pieces for this torrent that are still
     /// missing. Verified pins are dropped as a side effect so the set shrinks
     /// toward empty and the head-window cap lifts automatically.
@@ -189,47 +228,22 @@ impl LibtorrentDiskFileStream {
             return;
         }
 
-        // Only rejoin the swarm when the piece we are about to serve is actually
-        // missing. Re-reading an already-downloaded piece must not resume a
-        // torrent that the seeding-disabled policy paused, or playback of a
-        // complete file would keep waking it back into seeding.
-        if !self.handle.have_piece(piece) {
-            let status = self.handle.status();
-            if status.is_paused {
-                tracing::warn!(
-                    info_hash = %self.info_hash,
-                    file_idx = self.file_idx,
-                    state = status.state,
-                    finished = status.is_finished,
-                    auto_managed = status.is_auto_managed,
-                    error = %status.error,
-                    "disk-backed download was paused while active; resuming torrent"
-                );
-                self.handle.resume();
-                // prioritize_from is called on every retry (~every 50ms via the
-                // wait_for_piece wake timer), but reannounce/dht_announce are
-                // rate-limited on the tracker/DHT side -- a tracker ignores
-                // repeat announces faster than its min-interval, and a DHT
-                // get_peers lookup needs several round-trips to finish, which a
-                // brand-new lookup every 50ms cancels before it ever completes.
-                // Reuse the same cooldown as the stall-escalation reannounce
-                // below so the two paths can't double up on spam either.
-                if self.last_stall_reannounce.elapsed() >= Duration::from_secs(10) {
-                    self.last_stall_reannounce = Instant::now();
-                    let _ = self.handle.force_reannounce();
-                    let _ = self.handle.force_dht_announce();
-                }
-            }
-        }
-
         if self.last_prioritized_piece == piece {
             return;
         }
         self.last_prioritized_piece = piece;
 
+        if self.is_background_reader() {
+            if !self.handle.have_piece(piece) {
+                self.handle.set_piece_priority(piece, 4);
+                self.handle.set_piece_deadline(piece, 500);
+            }
+            return;
+        }
+
         let priority_intent = self.priority_intent();
-        let sequential_download = disk_backed_sequential_download(priority_intent);
-        self.handle.set_sequential_download(sequential_download);
+        let sequential_download = false;
+        self.handle.set_sequential_download(false);
         let configured_forward_window =
             disk_backed_forward_window_pieces_for(priority_intent, self.piece_length);
         let forward_window = self.active_forward_window(priority_intent, configured_forward_window);
@@ -257,23 +271,13 @@ impl LibtorrentDiskFileStream {
         // it first. The head's CURRENT piece still stays urgent via
         // reassert_requested_piece below; only read-ahead yields. The metadata
         // stream itself keeps full priority; background reads stay at 1.
-        let priority = if matches!(priority_intent, PlaybackIntent::Background) {
+        let read_ahead_priority = if matches!(priority_intent, PlaybackIntent::Background) {
             1
-        } else if cues_pending && !is_metadata_stream {
-            4
+        } else if matches!(priority_intent, PlaybackIntent::InternalProbe) {
+            2
         } else {
-            7
+            4
         };
-        // Set the file's baseline (whole file at priority 1 for streaming so it
-        // stays "wanted" and the torrent never falsely finishes after the head;
-        // 7 for explicit downloads) first, then raise only the active forward
-        // window below. set_file_priority resets stale per-piece priorities so a
-        // previous request's window cannot keep unrelated pieces ahead.
-        let file_baseline = disk_backed_file_baseline_priority(priority_intent);
-        if !self.multi_file_mode {
-            self.handle
-                .set_file_priority(self.file_idx as i32, file_baseline);
-        }
         let deadline_jitter = (self.stream_id % 10) as i32 * 5;
         for p in piece..=self.last_piece.min(piece + forward_window) {
             if !self.handle.have_piece(p) {
@@ -281,9 +285,16 @@ impl LibtorrentDiskFileStream {
                 let deadline = if distance == 0 {
                     0
                 } else {
-                    distance * 25 + deadline_jitter
+                    distance * 250 + deadline_jitter
                 };
-                self.handle.set_piece_priority(p, priority);
+                self.handle.set_piece_priority(
+                    p,
+                    if distance == 0 {
+                        7
+                    } else {
+                        read_ahead_priority
+                    },
+                );
                 self.handle.set_piece_deadline(p, deadline);
             }
         }
@@ -301,7 +312,6 @@ impl LibtorrentDiskFileStream {
             sequential_download,
             forward_window,
             configured_forward_window,
-            file_baseline,
             cues_pending,
             deadline_jitter,
             "disk-backed stream priority window configured"
@@ -314,16 +324,12 @@ impl LibtorrentDiskFileStream {
         }
 
         let priority_intent = self.priority_intent();
-        let file_baseline = disk_backed_file_baseline_priority(priority_intent);
-        if file_baseline == 0 && !self.multi_file_mode {
-            self.handle.set_file_priority(self.file_idx as i32, 0);
-        }
         self.handle.set_piece_priority(piece, 7);
         self.handle.set_piece_deadline(piece, 0);
         self.last_urgent_reassert = Instant::now();
         self.urgent_reassert_count = self.urgent_reassert_count.saturating_add(1);
 
-        if self.urgent_reassert_count <= 3 || self.urgent_reassert_count % 20 == 0 {
+        if self.urgent_reassert_count <= 3 || self.urgent_reassert_count.is_multiple_of(20) {
             let status = self.handle.status();
             tracing::info!(
                 info_hash = %self.info_hash,
@@ -334,7 +340,6 @@ impl LibtorrentDiskFileStream {
                 reassert_count = self.urgent_reassert_count,
                 peers = status.num_peers,
                 download_rate = status.download_rate,
-                file_baseline,
                 elapsed_ms = self.created_at.elapsed().as_millis() as u64,
                 reason,
                 "requested piece forced urgent"
@@ -357,19 +362,12 @@ impl LibtorrentDiskFileStream {
         let mut forward_window =
             disk_backed_forward_window_pieces_for(priority_intent, self.piece_length);
         forward_window = self.active_forward_window(priority_intent, forward_window);
-        if self.consecutive_waits >= 3 {
-            forward_window = (forward_window * 2).min(63);
-        }
-
-        let file_baseline = disk_backed_file_baseline_priority(priority_intent);
-        if file_baseline == 0 && !self.multi_file_mode {
-            self.handle.set_file_priority(self.file_idx as i32, 0);
-        }
         for p in piece..=self.last_piece.min(piece + forward_window) {
             if !self.handle.have_piece(p) {
                 let distance = p - piece;
-                self.handle.set_piece_priority(p, 7);
-                self.handle.set_piece_deadline(p, distance * 25);
+                self.handle
+                    .set_piece_priority(p, if distance == 0 { 7 } else { 4 });
+                self.handle.set_piece_deadline(p, distance * 250);
             }
         }
         self.reassert_requested_piece(piece, "blocked-replan");
@@ -378,35 +376,12 @@ impl LibtorrentDiskFileStream {
         let pinned_missing = self.pinned_metadata_missing();
         self.apply_pinned_metadata(&pinned_missing);
 
-        // A long stall with barely any progress usually means the current
-        // peers are choking us; announce to find fresh peers sooner.
-        if self.consecutive_waits >= 100
-            && self.last_stall_reannounce.elapsed() >= Duration::from_secs(30)
-        {
-            let status = self.handle.status();
-            if status.download_rate < 256 * 1024 {
-                self.last_stall_reannounce = Instant::now();
-                let _ = self.handle.force_reannounce();
-                let _ = self.handle.force_dht_announce();
-                tracing::info!(
-                    info_hash = %self.info_hash,
-                    file_idx = self.file_idx,
-                    piece,
-                    consecutive_waits = self.consecutive_waits,
-                    peers = status.num_peers,
-                    download_rate = status.download_rate,
-                    "disk-backed stream stalled; forcing tracker and DHT reannounce"
-                );
-            }
-        }
-
         tracing::debug!(
             info_hash = %self.info_hash,
             file_idx = self.file_idx,
             intent = ?priority_intent,
             piece,
             forward_window,
-            file_baseline,
             consecutive_waits = self.consecutive_waits,
             "disk-backed blocked piece re-prioritized"
         );
@@ -419,22 +394,18 @@ impl LibtorrentDiskFileStream {
     ) -> std::task::Poll<std::io::Result<()>> {
         self.consecutive_waits = self.consecutive_waits.saturating_add(1);
         self.prioritize_from(piece);
-        if self.last_urgent_reassert.elapsed() >= Duration::from_millis(URGENT_REASSERT_INTERVAL_MS)
-        {
-            self.reassert_requested_piece(piece, "wait-reassert");
+        if !self.is_background_reader() {
+            if self.last_urgent_reassert.elapsed()
+                >= Duration::from_millis(URGENT_REASSERT_INTERVAL_MS)
+            {
+                self.reassert_requested_piece(piece, "wait-reassert");
+            }
+            self.escalate_blocked_piece(piece);
         }
-        self.escalate_blocked_piece(piece);
         self.piece_waiter
             .register(&self.info_hash, piece, self.stream_id, cx.waker().clone());
 
-        if self.last_retry_wake.elapsed() >= Duration::from_millis(50) {
-            self.last_retry_wake = Instant::now();
-            let waker = cx.waker().clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                waker.wake();
-            });
-        }
+        self.schedule_retry(cx, Duration::from_millis(50));
 
         if self.last_wait_log.elapsed() >= Duration::from_secs(5) {
             self.last_wait_log = Instant::now();
@@ -492,6 +463,193 @@ impl LibtorrentDiskFileStream {
 
         std::task::Poll::Pending
     }
+
+    fn schedule_retry(&mut self, cx: &mut std::task::Context<'_>, delay: Duration) {
+        if self.retry_sleep.is_none() {
+            self.retry_sleep = Some(Box::pin(tokio::time::sleep(delay)));
+        }
+        let ready = self
+            .retry_sleep
+            .as_mut()
+            .is_some_and(|sleep| sleep.as_mut().poll(cx).is_ready());
+        if ready {
+            self.retry_sleep = None;
+            cx.waker().wake_by_ref();
+        }
+    }
+
+    fn request_piece_from_libtorrent(&mut self, piece: i32) {
+        if self
+            .piece_read_retry_at
+            .is_some_and(|(failed_piece, retry_at)| {
+                failed_piece == piece && Instant::now() < retry_at
+            })
+        {
+            return;
+        }
+        if self
+            .piece_read
+            .as_ref()
+            .is_some_and(|(requested, _)| *requested == piece)
+            || self
+                .broker_piece
+                .as_ref()
+                .is_some_and(|(cached, _)| *cached == piece)
+        {
+            return;
+        }
+
+        if let Some((requested, task)) = self.piece_read.take() {
+            if requested != piece {
+                task.abort();
+            } else {
+                self.piece_read = Some((requested, task));
+                return;
+            }
+        }
+        let alerts = self.alert_hub.clone();
+        let handle = self.handle.clone();
+        let info_hash = self.info_hash.clone();
+        let subordinate = self.is_background_reader();
+        let task = tokio::spawn(async move {
+            alerts
+                .read_piece(
+                    handle,
+                    &info_hash,
+                    piece,
+                    if subordinate { 4 } else { 7 },
+                    if subordinate { 500 } else { 0 },
+                    Duration::from_secs(2),
+                )
+                .await
+        });
+        self.piece_read = Some((piece, task));
+    }
+
+    fn poll_piece_broker(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        piece: i32,
+    ) -> std::io::Result<()> {
+        let Some((requested, task)) = self.piece_read.as_mut() else {
+            return Ok(());
+        };
+        if *requested != piece {
+            return Ok(());
+        }
+        match Pin::new(task).poll(cx) {
+            Poll::Ready(Ok(Ok(data))) => {
+                self.broker_piece = Some((piece, data));
+                self.piece_read = None;
+                self.piece_read_retry_at = None;
+            }
+            Poll::Ready(Ok(Err(error))) => {
+                tracing::debug!(
+                    info_hash = %self.info_hash,
+                    file_idx = self.file_idx,
+                    piece,
+                    %error,
+                    "read_piece broker did not produce bytes"
+                );
+                self.piece_read = None;
+                self.piece_read_retry_at =
+                    Some((piece, Instant::now() + Duration::from_millis(250)));
+            }
+            Poll::Ready(Err(error)) => {
+                self.piece_read = None;
+                if !error.is_cancelled() {
+                    self.piece_read_retry_at =
+                        Some((piece, Instant::now() + Duration::from_millis(250)));
+                    return Err(std::io::Error::other(error));
+                }
+            }
+            Poll::Pending => {}
+        }
+        Ok(())
+    }
+
+    fn serve_broker_piece(&mut self, piece: i32, buf: &mut tokio::io::ReadBuf<'_>) -> bool {
+        let Some((cached_piece, data)) = self.broker_piece.as_ref() else {
+            return false;
+        };
+        if *cached_piece != piece {
+            return false;
+        }
+        let Some((start, end)) = broker_slice_bounds(
+            piece,
+            self.piece_length,
+            self.file_offset,
+            self.current_pos,
+            self.file_size,
+            data.len(),
+            buf.remaining(),
+        ) else {
+            return false;
+        };
+        buf.put_slice(&data[start..end]);
+        self.current_pos = self.current_pos.saturating_add((end - start) as u64);
+        self.consecutive_waits = 0;
+        self.record_first_read(piece, "read-piece-alert");
+        self.prioritize_from(piece.saturating_add(1));
+        true
+    }
+
+    fn record_first_read(&mut self, piece: i32, source: &'static str) {
+        if self.first_read_logged {
+            return;
+        }
+        self.first_read_logged = true;
+        tracing::debug!(
+            info_hash = %self.info_hash,
+            file_idx = self.file_idx,
+            intent = ?self.playback_intent,
+            piece,
+            source,
+            elapsed_ms = self.created_at.elapsed().as_millis() as u64,
+            stage = "storage_readable",
+            "libtorrent playback startup stage"
+        );
+    }
+
+    fn poll_file_open(&mut self, cx: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
+        if self.file.is_some() {
+            return Poll::Ready(Ok(()));
+        }
+        if self.open_file.is_none() {
+            let file_path = self.file_path.clone();
+            self.open_file = Some(tokio::spawn(async move {
+                tokio::fs::OpenOptions::new()
+                    .read(true)
+                    .open(file_path)
+                    .await
+            }));
+        }
+        let Some(open_file) = self.open_file.as_mut() else {
+            return Poll::Pending;
+        };
+        match Pin::new(open_file).poll(cx) {
+            Poll::Ready(Ok(Ok(file))) => {
+                self.file = Some(file);
+                self.file_cursor = 0;
+                self.seek_pending = false;
+                self.open_file = None;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Ok(Err(error))) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.open_file = None;
+                Poll::Pending
+            }
+            Poll::Ready(Ok(Err(error))) => {
+                self.open_file = None;
+                Poll::Ready(Err(error))
+            }
+            Poll::Ready(Err(error)) => {
+                self.open_file = None;
+                Poll::Ready(Err(std::io::Error::other(error)))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 impl tokio::io::AsyncRead for LibtorrentDiskFileStream {
@@ -500,97 +658,137 @@ impl tokio::io::AsyncRead for LibtorrentDiskFileStream {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
+        use tokio::io::AsyncSeek;
+
+        if self.playback_permit.is_cancelled() {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "playback superseded by a newer torrent file",
+            )));
+        }
         if self.current_pos >= self.file_size || buf.remaining() == 0 {
-            return std::task::Poll::Ready(Ok(()));
+            return Poll::Ready(Ok(()));
         }
 
         let piece = match self.current_piece() {
             Ok(piece) => piece,
-            Err(err) => return std::task::Poll::Ready(Err(err)),
+            Err(err) => return Poll::Ready(Err(err)),
         };
 
         if piece < self.first_piece || piece > self.last_piece {
-            return std::task::Poll::Ready(Err(std::io::Error::new(
+            return Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "read position is outside selected torrent file",
             )));
         }
 
         if !self.handle.have_piece(piece) {
+            self.request_piece_from_libtorrent(piece);
+            if let Err(error) = self.poll_piece_broker(cx, piece) {
+                return Poll::Ready(Err(error));
+            }
+            if self.serve_broker_piece(piece, buf) {
+                return Poll::Ready(Ok(()));
+            }
             return self.wait_for_piece(piece, cx);
         }
 
         let verified_available = self.bytes_available_in_verified_piece(piece);
         if verified_available == 0 {
-            return std::task::Poll::Ready(Ok(()));
-        }
-        let to_read = buf.remaining().min(verified_available);
-
-        let mut file = match std::fs::File::open(&self.file_path) {
-            Ok(file) => file,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return self.wait_for_piece(piece, cx);
-            }
-            Err(err) => return std::task::Poll::Ready(Err(err)),
-        };
-
-        if let Err(err) = file.seek(std::io::SeekFrom::Start(self.current_pos)) {
-            return std::task::Poll::Ready(Err(err));
+            return Poll::Ready(Ok(()));
         }
 
-        let mut scratch = vec![0u8; to_read.min(256 * 1024)];
-        let read = match file.read(&mut scratch) {
-            // A verified piece (have_piece == true) whose bytes are not yet on
-            // disk -- write-back lag, or the file not yet extended -- reads as
-            // EOF here. Force a flush so it materialises instead of waiting
-            // forever; without this the stream can deadlock when the torrent has
-            // gone idle and would never flush on its own.
-            Ok(0) => {
-                self.handle.flush_cache();
-                return self.wait_for_piece(piece, cx);
-            }
-            Ok(read) => read,
-            Err(err) => return std::task::Poll::Ready(Err(err)),
-        };
+        if !self.first_read_logged || self.file.is_none() {
+            self.request_piece_from_libtorrent(piece);
+        }
+        if let Err(error) = self.poll_piece_broker(cx, piece) {
+            return Poll::Ready(Err(error));
+        }
+        if self.serve_broker_piece(piece, buf) {
+            return Poll::Ready(Ok(()));
+        }
 
-        // A verified piece can still be in libtorrent's write cache before it
-        // reaches the OS file, in which case the preallocated region reads as
-        // zeros. No media container starts with an all-zero header, so treat
-        // zeros at the very start of the file as "not flushed yet" and wait
-        // instead of serving garbage that makes the player report an invalid
-        // file format.
-        if self.current_pos == 0
-            && !self.first_read_logged
-            && scratch[..read].iter().all(|&b| b == 0)
+        match self.poll_file_open(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => {
+                self.request_piece_from_libtorrent(piece);
+                self.schedule_retry(cx, Duration::from_millis(25));
+                return Poll::Pending;
+            }
+        }
+
+        if self.file_cursor != self.current_pos {
+            if !self.seek_pending {
+                let target = self.current_pos;
+                let Some(file) = self.file.as_mut() else {
+                    return Poll::Pending;
+                };
+                if let Err(error) = Pin::new(file).start_seek(std::io::SeekFrom::Start(target)) {
+                    return Poll::Ready(Err(error));
+                }
+                self.seek_pending = true;
+            }
+            let Some(file) = self.file.as_mut() else {
+                return Poll::Pending;
+            };
+            match Pin::new(file).poll_complete(cx) {
+                Poll::Ready(Ok(position)) => {
+                    self.file_cursor = position;
+                    self.seek_pending = false;
+                }
+                Poll::Ready(Err(error)) => {
+                    self.seek_pending = false;
+                    return Poll::Ready(Err(error));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        let to_read = buf
+            .remaining()
+            .min(verified_available)
+            .min(self.scratch.len());
+        let read_poll = {
+            let this = self.as_mut().get_mut();
+            let (file, scratch) = (&mut this.file, &mut this.scratch);
+            let Some(file) = file.as_mut() else {
+                return Poll::Pending;
+            };
+            let mut scratch_buf = tokio::io::ReadBuf::new(&mut scratch[..to_read]);
+            match Pin::new(file).poll_read(cx, &mut scratch_buf) {
+                Poll::Ready(Ok(())) => {
+                    let read = scratch_buf.filled().len();
+                    Poll::Ready(Ok(read))
+                }
+                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+                Poll::Pending => Poll::Pending,
+            }
+        };
+        let read = match read_poll {
+            Poll::Ready(Ok(read)) => read,
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => return Poll::Pending,
+        };
+        self.file_cursor = self.file_cursor.saturating_add(read as u64);
+
+        if read == 0
+            || (self.current_pos == 0
+                && !self.first_read_logged
+                && self.scratch[..read].iter().all(|&byte| byte == 0))
         {
-            tracing::info!(
-                info_hash = %self.info_hash,
-                file_idx = self.file_idx,
-                piece,
-                read,
-                "disk-backed file head reads as zeros; waiting for disk cache flush"
-            );
-            self.handle.flush_cache();
-            return self.wait_for_piece(piece, cx);
+            self.request_piece_from_libtorrent(piece);
+            self.schedule_retry(cx, Duration::from_millis(25));
+            return Poll::Pending;
         }
 
-        buf.put_slice(&scratch[..read]);
-        self.current_pos += read as u64;
+        buf.put_slice(&self.scratch[..read]);
+        self.current_pos = self.current_pos.saturating_add(read as u64);
         self.consecutive_waits = 0;
-        if !self.first_read_logged {
-            self.first_read_logged = true;
-            tracing::info!(
-                info_hash = %self.info_hash,
-                file_idx = self.file_idx,
-                intent = ?self.playback_intent,
-                piece,
-                elapsed_ms = self.created_at.elapsed().as_millis() as u64,
-                "disk-backed first bytes ready"
-            );
-        }
+        self.record_first_read(piece, "async-file");
         self.prioritize_from(piece.saturating_add(1));
 
-        std::task::Poll::Ready(Ok(()))
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -611,6 +809,11 @@ impl tokio::io::AsyncSeek for LibtorrentDiskFileStream {
 
         self.current_pos = new_pos.min(self.file_size);
         self.last_prioritized_piece = -1;
+        self.broker_piece = None;
+        if let Some((_, task)) = self.piece_read.take() {
+            task.abort();
+        }
+        self.piece_read_retry_at = None;
         Ok(())
     }
 
@@ -624,6 +827,29 @@ impl tokio::io::AsyncSeek for LibtorrentDiskFileStream {
 
 impl Drop for LibtorrentDiskFileStream {
     fn drop(&mut self) {
+        if let Some((_, task)) = self.piece_read.take() {
+            task.abort();
+        }
+        if let Some(task) = self.open_file.take() {
+            task.abort();
+        }
         self.piece_waiter.unregister_stream(self.stream_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::broker_slice_bounds;
+
+    #[test]
+    fn broker_slices_a_file_that_starts_inside_a_shared_piece() {
+        // Piece 2 spans global bytes 32..48. This file starts four bytes into
+        // that piece, so only piece bytes 4..16 belong to its first read.
+        assert_eq!(broker_slice_bounds(2, 16, 36, 0, 20, 16, 64), Some((4, 16)));
+    }
+
+    #[test]
+    fn broker_does_not_cross_the_selected_file_boundary() {
+        assert_eq!(broker_slice_bounds(2, 16, 32, 0, 5, 16, 64), Some((0, 5)));
     }
 }

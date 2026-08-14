@@ -135,7 +135,7 @@ impl ArchiveReader for SevenZHandler {
 
             // Spawn extraction task
             tokio::spawn(async move {
-                let res = (async || -> Result<()> {
+                let res: Result<()> = async {
                     // Re-open archive for extraction (the previous one was just for metadata)
                     let file = tokio::fs::File::open(&archive_path).await?;
                     let archive = SevenZ::open(file)
@@ -156,7 +156,7 @@ impl ArchiveReader for SevenZHandler {
                     }
 
                     Ok(())
-                })()
+                }
                 .await;
 
                 if let Err(e) = res {

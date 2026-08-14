@@ -95,10 +95,8 @@ impl AsyncRead for NzbFileStream {
                                 self.current_segment_idx += 1;
                                 continue; // Loop back to write to buf
                             }
-                            Ok(Err(e)) => {
-                                Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string())))
-                            }
-                            Err(e) => Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string()))), // JoinError
+                            Ok(Err(e)) => Poll::Ready(Err(Error::other(e.to_string()))),
+                            Err(e) => Poll::Ready(Err(Error::other(e.to_string()))), // JoinError
                         }
                     }
                     Poll::Pending => Poll::Pending,
@@ -113,7 +111,7 @@ impl AsyncRead for NzbFileStream {
                     session
                         .fetch_segment(&segment.id)
                         .await
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                        .map_err(|e| std::io::Error::other(e.to_string()))
                 });
                 self.fetch_future = Some(fut);
                 self.fetching = true;
@@ -149,10 +147,10 @@ fn decode_yenc(input: &[u8]) -> anyhow::Result<Vec<u8>> {
     }
 
     // Check for =ypart
-    if input[data_start..].starts_with(part_marker) {
-        if let Some(pos) = input[data_start..].iter().position(|&b| b == b'\n') {
-            data_start += pos + 1;
-        }
+    if input[data_start..].starts_with(part_marker)
+        && let Some(pos) = input[data_start..].iter().position(|&b| b == b'\n')
+    {
+        data_start += pos + 1;
     }
 
     let mut output = Vec::with_capacity(input.len());

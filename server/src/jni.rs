@@ -21,6 +21,12 @@ fn init_android_tls_verifier(_env: &mut Env, _context: JObject) -> jni::errors::
 }
 
 #[unsafe(no_mangle)]
+/// Starts the embedded server from a JVM native call.
+///
+/// # Safety
+///
+/// The JNI environment and object handles must be valid for the duration of
+/// this call and must originate from the invoking JVM thread.
 pub unsafe extern "C" fn Java_com_stremio_mobile_server_JniStreamingServerController_startServerNative(
     mut env: EnvUnowned,
     _class: JClass,
@@ -76,11 +82,7 @@ pub unsafe extern "C" fn Java_com_stremio_mobile_server_JniStreamingServerContro
             }
             Err(err) => {
                 let err_msg = format!("Failed to start server: {}", err);
-                let jni_err_msg = jni::strings::JNIString::try_from(err_msg).unwrap_or_else(|_| {
-                    jni::strings::JNIString::from(jni::jni_str!(
-                        "Failed to start server due to encoding error"
-                    ))
-                });
+                let jni_err_msg = jni::strings::JNIString::from(err_msg);
                 let _ = env.throw_new(jni::jni_str!("java/lang/RuntimeException"), jni_err_msg);
                 Ok(std::ptr::null_mut())
             }
@@ -90,6 +92,12 @@ pub unsafe extern "C" fn Java_com_stremio_mobile_server_JniStreamingServerContro
 }
 
 #[unsafe(no_mangle)]
+/// Stops the embedded server from a JVM native call.
+///
+/// # Safety
+///
+/// The JNI environment and class handle must originate from the invoking JVM
+/// thread.
 pub unsafe extern "C" fn Java_com_stremio_mobile_server_JniStreamingServerController_stopServerNative(
     _env: EnvUnowned,
     _class: JClass,
@@ -102,6 +110,12 @@ pub unsafe extern "C" fn Java_com_stremio_mobile_server_JniStreamingServerContro
 }
 
 #[unsafe(no_mangle)]
+/// Returns the embedded server URL to a JVM native caller.
+///
+/// # Safety
+///
+/// The JNI environment and class handle must be valid for the duration of this
+/// call and must originate from the invoking JVM thread.
 pub unsafe extern "C" fn Java_com_stremio_mobile_server_JniStreamingServerController_getServerUrlNative(
     mut env: EnvUnowned,
     _class: JClass,

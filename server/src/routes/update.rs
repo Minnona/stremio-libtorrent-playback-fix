@@ -36,6 +36,22 @@ struct ChangelogQuery {
     force: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct LocalOnly;
+
+impl IntoResponse for LocalOnly {
+    fn into_response(self) -> Response {
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "error": "update endpoints are local-only"
+            })),
+        )
+            .into_response()
+    }
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/status", get(status))
@@ -51,7 +67,7 @@ async fn status(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Response {
     if let Err(response) = ensure_local(addr) {
-        return response;
+        return response.into_response();
     }
 
     let settings = state.settings.read().await.clone();
@@ -66,7 +82,7 @@ async fn changelog(
     Query(query): Query<ChangelogQuery>,
 ) -> Response {
     if let Err(response) = ensure_local(addr) {
-        return response;
+        return response.into_response();
     }
 
     let settings = state.settings.read().await.clone();
@@ -79,7 +95,7 @@ async fn check(
     payload: Option<Json<CheckRequest>>,
 ) -> Response {
     if let Err(response) = ensure_local(addr) {
-        return response;
+        return response.into_response();
     }
 
     let request = payload.map(|Json(payload)| payload).unwrap_or_default();
@@ -99,7 +115,7 @@ async fn download(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Response {
     if let Err(response) = ensure_local(addr) {
-        return response;
+        return response.into_response();
     }
 
     match state.updater.download_update().await {
@@ -114,7 +130,7 @@ async fn install(
     payload: Option<Json<InstallRequest>>,
 ) -> Response {
     if let Err(response) = ensure_local(addr) {
-        return response;
+        return response.into_response();
     }
 
     let request = payload.map(|Json(payload)| payload).unwrap_or_default();
@@ -134,7 +150,7 @@ async fn cancel(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Response {
     if let Err(response) = ensure_local(addr) {
-        return response;
+        return response.into_response();
     }
 
     match state.updater.cancel_update().await {
@@ -143,18 +159,11 @@ async fn cancel(
     }
 }
 
-fn ensure_local(addr: SocketAddr) -> Result<(), Response> {
+fn ensure_local(addr: SocketAddr) -> Result<(), LocalOnly> {
     if addr.ip().is_loopback() {
         Ok(())
     } else {
-        Err((
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "success": false,
-                "error": "update endpoints are local-only"
-            })),
-        )
-            .into_response())
+        Err(LocalOnly)
     }
 }
 

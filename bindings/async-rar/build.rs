@@ -79,18 +79,17 @@ fn find_include_paths() -> Vec<PathBuf> {
                 ));
                 if p.exists() {
                     // Find latest version
-                    if let Ok(entries) = std::fs::read_dir(&p) {
-                        if let Some(latest) = entries
+                    if let Ok(entries) = std::fs::read_dir(&p)
+                        && let Some(latest) = entries
                             .filter_map(Result::ok)
                             .filter(|e| e.path().is_dir())
                             .map(|e| e.path())
                             .max()
-                        {
-                            let include = latest.join("include");
-                            if include.exists() {
-                                msvc_path = Some(include);
-                                break;
-                            }
+                    {
+                        let include = latest.join("include");
+                        if include.exists() {
+                            msvc_path = Some(include);
+                            break;
                         }
                     }
                 }
@@ -123,11 +122,7 @@ fn find_include_paths() -> Vec<PathBuf> {
                 .filter(|e| e.path().is_dir())
                 .map(|e| e.path())
                 .filter(|p| {
-                    p.file_name()
-                        .unwrap()
-                        .to_str()
-                        .unwrap()
-                        .starts_with("10.")
+                    p.file_name().unwrap().to_str().unwrap().starts_with("10.")
                         && p.join("um").join("Windows.h").exists()
                         && p.join("ucrt").exists()
                 })
@@ -373,7 +368,7 @@ fn main() {
 
     let mut b = autocxx_build::Builder::new(
         "src/ffi.rs",
-        &[unrar_src.as_path(), PathBuf::from("src/cpp").as_path()],
+        [unrar_src.as_path(), PathBuf::from("src/cpp").as_path()],
     )
     .extra_clang_args(&clang_args_refs)
     .build()

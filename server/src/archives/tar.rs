@@ -131,7 +131,7 @@ impl AsyncSeek for AsyncRawFileSlice {
             std::io::SeekFrom::Start(p) => p,
             std::io::SeekFrom::End(p) => {
                 if p < 0 {
-                    self.size.saturating_sub(p.abs() as u64)
+                    self.size.saturating_sub(p.unsigned_abs())
                 } else {
                     self.size + p as u64
                 }

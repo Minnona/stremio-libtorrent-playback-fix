@@ -185,6 +185,12 @@ struct RustWriterContext {
 }
 
 #[no_mangle]
+/// Writes a buffer supplied by the native 7-Zip callback into the Rust writer.
+///
+/// # Safety
+///
+/// `ctx` must point to a live [`RustWriterContext`], `buf` must be readable for
+/// `size` bytes, and a non-null `processed` pointer must be writable.
 pub unsafe extern "C" fn rust_write_cb(
     ctx: *mut c_void,
     buf: *const c_void,

@@ -125,7 +125,8 @@ async fn create_session_internal(
         let utf16 = match lz_str::decompress_from_encoded_uri_component(&lz) {
             Some(u) => u,
             None => {
-                return (StatusCode::BAD_REQUEST, "Failed to decompress lz payload").into_response();
+                return (StatusCode::BAD_REQUEST, "Failed to decompress lz payload")
+                    .into_response();
             }
         };
         let json_str = match String::from_utf16(&utf16) {
@@ -235,15 +236,15 @@ async fn create_session_internal(
     tracing::info!("Created NZB session {}", key);
 
     // 4. Redirect if GET, otherwise return JSON response
-    if method == axum::http::Method::GET {
-        if let Some(subject) = first_file_subject {
-            return Redirect::temporary(&format!(
-                "./stream/{}/{}",
-                urlencoding::encode(&key),
-                urlencoding::encode(&subject)
-            ))
-            .into_response();
-        }
+    if method == axum::http::Method::GET
+        && let Some(subject) = first_file_subject
+    {
+        return Redirect::temporary(&format!(
+            "./stream/{}/{}",
+            urlencoding::encode(&key),
+            urlencoding::encode(&subject)
+        ))
+        .into_response();
     }
 
     Json(CreateResponse { key }).into_response()

@@ -21,24 +21,16 @@ pub struct FileCandidate {
 pub fn query_values(query: Option<&str>, name: &str) -> Vec<String> {
     query
         .map(|q| {
-            url::form_urlencoded::parse(q.as_bytes())
-                .filter_map(|(key, value)| (key == name).then(|| value.into_owned()))
+            q.split('&')
+                .filter(|field| field.split_once('=').unwrap_or((field, "")).0 == name)
+                .filter_map(|field| {
+                    url::form_urlencoded::parse(field.as_bytes())
+                        .next()
+                        .map(|(_, value)| value.into_owned())
+                })
                 .collect()
         })
         .unwrap_or_default()
-}
-
-pub fn query_flag(query: Option<&str>, name: &str) -> bool {
-    query
-        .map(|q| {
-            url::form_urlencoded::parse(q.as_bytes()).any(|(key, value)| {
-                key == name
-                    && (value == "1"
-                        || value.eq_ignore_ascii_case("true")
-                        || value.eq_ignore_ascii_case("yes"))
-            })
-        })
-        .unwrap_or(false)
 }
 
 pub fn normalize_tracker_sources(sources: Vec<String>) -> Vec<String> {
@@ -153,14 +145,14 @@ pub fn resolve_file_idx(
         return Err("No files available".to_string());
     }
 
-    if !filters.is_empty() {
-        if let Some(file) = files.iter().find(|file| {
+    if !filters.is_empty()
+        && let Some(file) = files.iter().find(|file| {
             filters
                 .iter()
                 .any(|filter| file_matches_filter(&file.name, filter))
-        }) {
-            return Ok(file.index);
-        }
+        })
+    {
+        return Ok(file.index);
     }
 
     files

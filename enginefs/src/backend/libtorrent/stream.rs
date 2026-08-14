@@ -1,6 +1,9 @@
 //! File stream implementation for libtorrent backend
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use crate::backend::priorities::{
@@ -21,6 +24,9 @@ pub(crate) enum SeekType {
     /// Container metadata read (moov, Cues at end of file)
     ContainerMetadata,
 }
+
+type DiskLookupTask = tokio::task::JoinHandle<Option<Arc<Vec<u8>>>>;
+type DiskLookup = (i32, DiskLookupTask);
 
 pub(crate) struct LibtorrentFileStream {
     pub(crate) handle: libtorrent_sys::LibtorrentHandle,
@@ -65,17 +71,36 @@ pub(crate) struct LibtorrentFileStream {
     pub(crate) first_wait_logged: bool,
     /// Last time repeated stuck-piece wait state was logged
     pub(crate) last_wait_log: Instant,
-    /// Last time a fallback retry wake was scheduled
-    pub(crate) last_retry_wake: Instant,
     /// Last piece for which direct playback reasserted urgent priority
     pub(crate) last_blocking_piece: i32,
     /// Last time direct playback reasserted urgent priority for a blocked piece
     pub(crate) last_blocking_priority: Instant,
     /// Consecutive pending waits for the current playback piece
     pub(crate) consecutive_waits: u32,
+    /// One reusable timer for fallback polling when no piece alert arrives.
+    pub(crate) retry_sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+    /// At most one optional disk-cache lookup is polled at a time.
+    pub(crate) disk_lookup: Option<DiskLookup>,
+    /// Avoid repeating a disk miss on every poll for the same piece.
+    pub(crate) disk_lookup_miss: Option<i32>,
+    pub(crate) playback_permit: super::playback::LibtorrentPlaybackPermit,
 }
 
 impl LibtorrentFileStream {
+    fn schedule_retry(&mut self, cx: &mut std::task::Context<'_>, delay: Duration) {
+        if self.retry_sleep.is_none() {
+            self.retry_sleep = Some(Box::pin(tokio::time::sleep(delay)));
+        }
+        let ready = self
+            .retry_sleep
+            .as_mut()
+            .is_some_and(|sleep| sleep.as_mut().poll(cx).is_ready());
+        if ready {
+            self.retry_sleep = None;
+            cx.waker().wake_by_ref();
+        }
+    }
+
     fn set_priorities(&mut self, pos: u64) {
         // Skip if already complete
         if self.is_complete {
@@ -406,15 +431,24 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
+        if self.playback_permit.is_cancelled() {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "playback superseded by a newer torrent file",
+            )));
+        }
+        if self.current_pos >= self.file_size || buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
         let pos = self.current_pos;
         self.set_priorities(pos);
 
         // Calculate which piece we need
-        let piece = if self.piece_length > 0 {
-            ((self.file_offset + pos) / self.piece_length) as i32
-        } else {
-            -1
-        };
+        let piece = self
+            .file_offset
+            .saturating_add(pos)
+            .checked_div(self.piece_length)
+            .map_or(-1, |piece| piece as i32);
 
         if piece >= 0 {
             libtorrent_sys::memory_label_last_unlabeled_storage(&self.info_hash);
@@ -434,7 +468,8 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                 if let Some((_, data, _)) = &self.cached_piece_data {
                     let offset_in_cached = ((self.file_offset + pos) % self.piece_length) as usize;
                     let available = data.len().saturating_sub(offset_in_cached);
-                    let to_read = buf.remaining().min(available);
+                    let remaining_file = self.file_size.saturating_sub(pos) as usize;
+                    let to_read = buf.remaining().min(available).min(remaining_file);
 
                     if to_read > 0 {
                         buf.put_slice(&data[offset_in_cached..offset_in_cached + to_read]);
@@ -442,14 +477,14 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                         self.consecutive_waits = 0;
                         if !self.first_read_logged {
                             self.first_read_logged = true;
-                            tracing::info!(
+                            tracing::debug!(
                                 "startup: first direct-stream bytes ready after {:?} (piece={}, source=local-cache)",
                                 self.created_at.elapsed(),
                                 piece
                             );
                         }
 
-                        if pos % (1024 * 1024) == 0 || pos < 4096 {
+                        if pos.is_multiple_of(1024 * 1024) || pos < 4096 {
                             tracing::debug!(
                                 "poll_read: Served {} bytes from MEMORY cache (piece {}, offset_in_cached={})",
                                 to_read,
@@ -467,16 +502,17 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                 return std::task::Poll::Ready(Ok(()));
             }
 
-            // Try to get from moka cache (check synchronously)
-            if let Some(piece_data) =
-                futures::executor::block_on(self.piece_cache.get_piece(&self.info_hash, piece))
-            {
+            // Try the synchronous Moka hot path. Optional disk persistence is
+            // loaded through one stored future below.
+            if let Some(piece_data) = self.piece_cache.get_cached_piece(&self.info_hash, piece) {
                 self.requested_piece_via_api.remove(&piece);
+                self.disk_lookup_miss = None;
                 let offset_in_cached = ((self.file_offset + pos) % self.piece_length) as usize;
                 self.cached_piece_data = Some((piece, piece_data.clone(), 0));
 
                 let available = piece_data.len().saturating_sub(offset_in_cached);
-                let to_read = buf.remaining().min(available);
+                let remaining_file = self.file_size.saturating_sub(pos) as usize;
+                let to_read = buf.remaining().min(available).min(remaining_file);
 
                 if to_read > 0 {
                     buf.put_slice(&piece_data[offset_in_cached..offset_in_cached + to_read]);
@@ -484,7 +520,7 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                     self.consecutive_waits = 0;
                     if !self.first_read_logged {
                         self.first_read_logged = true;
-                        tracing::info!(
+                        tracing::debug!(
                             "startup: first direct-stream bytes ready after {:?} (piece={}, source=piece-cache)",
                             self.created_at.elapsed(),
                             piece
@@ -555,6 +591,48 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
 
                 return std::task::Poll::Ready(Ok(()));
             }
+
+            if self
+                .disk_lookup
+                .as_ref()
+                .is_some_and(|(lookup_piece, _)| *lookup_piece != piece)
+                && let Some((_, task)) = self.disk_lookup.take()
+            {
+                task.abort();
+            }
+            if self.disk_lookup.is_none() && self.disk_lookup_miss != Some(piece) {
+                let cache = self.piece_cache.clone();
+                let info_hash = self.info_hash.clone();
+                self.disk_lookup = Some((
+                    piece,
+                    tokio::spawn(async move { cache.get_piece(&info_hash, piece).await }),
+                ));
+            }
+            if let Some((lookup_piece, lookup)) = self.disk_lookup.as_mut() {
+                let lookup_piece = *lookup_piece;
+                match Pin::new(lookup).poll(cx) {
+                    Poll::Ready(Ok(Some(piece_data))) => {
+                        self.disk_lookup = None;
+                        if lookup_piece == piece {
+                            self.disk_lookup_miss = None;
+                            self.cached_piece_data = Some((piece, piece_data, 0));
+                            cx.waker().wake_by_ref();
+                            return Poll::Pending;
+                        }
+                    }
+                    Poll::Ready(Ok(None)) => {
+                        self.disk_lookup = None;
+                        self.disk_lookup_miss = Some(lookup_piece);
+                    }
+                    Poll::Ready(Err(error)) => {
+                        self.disk_lookup = None;
+                        if !error.is_cancelled() {
+                            return Poll::Ready(Err(std::io::Error::other(error)));
+                        }
+                    }
+                    Poll::Pending => {}
+                }
+            }
         }
 
         // Not in cache - check if piece is available in libtorrent
@@ -566,14 +644,7 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
             self.piece_waiter
                 .register(&self.info_hash, piece, self.stream_id, cx.waker().clone());
 
-            if self.last_retry_wake.elapsed() >= std::time::Duration::from_millis(50) {
-                self.last_retry_wake = Instant::now();
-                let waker = cx.waker().clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    waker.wake();
-                });
-            }
+            self.schedule_retry(cx, Duration::from_millis(50));
 
             if self.last_wait_log.elapsed() >= std::time::Duration::from_secs(5) {
                 self.last_wait_log = Instant::now();
@@ -611,9 +682,6 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
             let piece_data = libtorrent_sys::memory_read_piece_direct(&self.info_hash, piece);
             if !piece_data.is_empty() {
                 // Got data directly! Cache it and serve immediately on next poll.
-                let info_hash = self.info_hash.clone();
-                let cache = self.piece_cache.clone();
-                let waiter = self.piece_waiter.clone();
                 self.requested_piece_via_api.insert(piece, Instant::now());
                 tracing::info!(
                     "poll_read: Direct read piece {} from memory storage ({} bytes)",
@@ -621,10 +689,11 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                     piece_data.len()
                 );
                 self.reassert_serving_window(piece);
-                tokio::spawn(async move {
-                    cache.put_piece(&info_hash, piece, piece_data).await;
-                    waiter.notify_piece_finished(&info_hash, piece);
-                });
+                self.piece_cache
+                    .put_piece_now(&self.info_hash, piece, piece_data);
+                self.disk_lookup_miss = None;
+                self.piece_waiter
+                    .notify_piece_finished(&self.info_hash, piece);
             } else {
                 self.consecutive_waits = self.consecutive_waits.saturating_add(1);
                 tracing::debug!(
@@ -639,14 +708,7 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                 );
             }
 
-            if self.last_retry_wake.elapsed() >= std::time::Duration::from_millis(10) {
-                self.last_retry_wake = Instant::now();
-                let waker = cx.waker().clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                    waker.wake();
-                });
-            }
+            self.schedule_retry(cx, Duration::from_millis(10));
             return std::task::Poll::Pending;
         }
 
@@ -665,13 +727,10 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                 );
                 let piece_data = libtorrent_sys::memory_read_piece_direct(&self.info_hash, piece);
                 if !piece_data.is_empty() {
-                    let info_hash = self.info_hash.clone();
-                    let cache = self.piece_cache.clone();
-                    let waiter = self.piece_waiter.clone();
-                    tokio::spawn(async move {
-                        cache.put_piece(&info_hash, piece, piece_data).await;
-                        waiter.notify_piece_finished(&info_hash, piece);
-                    });
+                    self.piece_cache
+                        .put_piece_now(&self.info_hash, piece, piece_data);
+                    self.piece_waiter
+                        .notify_piece_finished(&self.info_hash, piece);
                 }
                 self.requested_piece_via_api.insert(piece, Instant::now());
             }
@@ -682,21 +741,13 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
                 piece,
                 self.handle.have_piece(piece)
             );
-            if self.last_retry_wake.elapsed() >= std::time::Duration::from_millis(15) {
-                self.last_retry_wake = Instant::now();
-                let waker = cx.waker().clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
-                    waker.wake();
-                });
-            }
+            self.schedule_retry(cx, Duration::from_millis(15));
             return std::task::Poll::Pending;
         }
 
         // Should not reach here
         tracing::error!("poll_read: Unexpected state - piece={}, pos={}", piece, pos);
-        std::task::Poll::Ready(Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        std::task::Poll::Ready(Err(std::io::Error::other(
             "Memory-only streaming: unexpected state in poll_read",
         )))
     }
@@ -704,6 +755,9 @@ impl tokio::io::AsyncRead for LibtorrentFileStream {
 
 impl Drop for LibtorrentFileStream {
     fn drop(&mut self) {
+        if let Some((_, task)) = self.disk_lookup.take() {
+            task.abort();
+        }
         self.piece_waiter.unregister_stream(self.stream_id);
     }
 }
@@ -739,6 +793,10 @@ impl tokio::io::AsyncSeek for LibtorrentFileStream {
         self.current_pos = new_pos;
         // Invalidate local cached piece data since position changed
         self.cached_piece_data = None;
+        if let Some((_, task)) = self.disk_lookup.take() {
+            task.abort();
+        }
+        self.disk_lookup_miss = None;
         Ok(())
     }
 
@@ -749,11 +807,11 @@ impl tokio::io::AsyncSeek for LibtorrentFileStream {
         // Memory-only mode: position is already set in start_seek
         let pos = self.current_pos;
 
-        let piece_idx = if self.piece_length > 0 {
-            ((self.file_offset + pos) / self.piece_length) as i32
-        } else {
-            -1
-        };
+        let piece_idx = self
+            .file_offset
+            .saturating_add(pos)
+            .checked_div(self.piece_length)
+            .map_or(-1, |piece| piece as i32);
 
         if piece_idx != self.last_priorities_piece {
             self.set_priorities(pos);

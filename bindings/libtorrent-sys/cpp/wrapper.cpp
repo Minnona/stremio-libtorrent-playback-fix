@@ -325,10 +325,13 @@ std::unique_ptr<Session> create_session(SessionSettings const &settings) {
   // Outgoing connections
   pack.set_int(lt::settings_pack::unchoke_slots_limit, 20); // (was 8)
 
-  // Alert mask for debugging (can remove in production)
+  // Playback needs storage/control alerts plus piece_finished_alert, whose
+  // category is piece_progress in libtorrent 2.x. Peer alerts are intentionally
+  // omitted from this latency-sensitive pump.
   pack.set_int(lt::settings_pack::alert_mask,
-               lt::alert_category::error | lt::alert_category::peer |
-                   lt::alert_category::status | lt::alert_category::storage);
+               lt::alert_category::error | lt::alert_category::status |
+                   lt::alert_category::storage |
+                   lt::alert_category::piece_progress);
 
   apply_proxy_settings(pack, settings);
 
@@ -407,8 +410,9 @@ create_session_memory_only(SessionSettings const &settings) {
   pack.set_int(lt::settings_pack::unchoke_slots_limit, 20);
 
   pack.set_int(lt::settings_pack::alert_mask,
-               lt::alert_category::error | lt::alert_category::peer |
-                   lt::alert_category::status | lt::alert_category::storage);
+               lt::alert_category::error | lt::alert_category::status |
+                   lt::alert_category::storage |
+                   lt::alert_category::piece_progress);
 
   apply_proxy_settings(pack, settings);
 
@@ -519,10 +523,16 @@ session_add_torrent(Session &session, AddTorrentParams const &params) {
 
   if (params.paused)
     p.flags |= lt::torrent_flags::paused;
+  else
+    p.flags &= ~lt::torrent_flags::paused;
   if (params.auto_managed)
     p.flags |= lt::torrent_flags::auto_managed;
+  else
+    p.flags &= ~lt::torrent_flags::auto_managed;
   if (params.sequential_download)
     p.flags |= lt::torrent_flags::sequential_download;
+  else
+    p.flags &= ~lt::torrent_flags::sequential_download;
 
   p.upload_limit = params.upload_limit;
   p.download_limit = params.download_limit;
@@ -555,11 +565,9 @@ std::unique_ptr<TorrentHandle> session_add_magnet(Session &session,
   // direct conflict with) our explicit handle_pause/handle_resume calls. We
   // always want full manual control, so clear the flag at creation time.
   p.flags &= ~lt::torrent_flags::auto_managed;
-  // The library default flags also include torrent_flags::paused, so a magnet
-  // torrent is added PAUSED and every peer connection waits until something
-  // resumes it. Clear it here so the torrent starts running immediately and a
-  // stream never has to fight an initial (or spuriously re-applied) pause.
-  p.flags &= ~lt::torrent_flags::paused;
+  // Keep the magnet paused until a metadata or playback permit activates it.
+  // This lets the Rust coordinator be the sole owner of resume ordering.
+  p.flags |= lt::torrent_flags::paused;
 
   lt::torrent_handle h = session.session.add_torrent(p);
   if (!h.is_valid())
@@ -855,6 +863,17 @@ void handle_force_reannounce(TorrentHandle &handle) {
   handle.handle.force_reannounce();
 }
 
+void handle_force_reannounce_with_flags(TorrentHandle &handle,
+                                        bool high_priority,
+                                        bool ignore_min_interval) {
+  auto flags = lt::reannounce_flags_t{};
+  if (high_priority)
+    flags |= lt::torrent_handle::high_priority;
+  if (ignore_min_interval)
+    flags |= lt::torrent_handle::ignore_min_interval;
+  handle.handle.force_reannounce(0, -1, flags);
+}
+
 void handle_force_dht_announce(TorrentHandle &handle) {
   handle.handle.force_dht_announce();
 }
@@ -881,6 +900,17 @@ bool handle_is_sequential_download(TorrentHandle const &handle) {
 void handle_set_piece_deadline(TorrentHandle &handle, int32_t piece,
                                int32_t deadline_ms) {
   handle.handle.set_piece_deadline(lt::piece_index_t(piece), deadline_ms);
+}
+
+void handle_set_piece_deadline_with_alert(TorrentHandle &handle, int32_t piece,
+                                          int32_t deadline_ms,
+                                          bool alert_when_available) {
+  if (alert_when_available) {
+    handle.handle.set_piece_deadline(lt::piece_index_t(piece), deadline_ms,
+                                     lt::torrent_handle::alert_when_available);
+  } else {
+    handle.handle.set_piece_deadline(lt::piece_index_t(piece), deadline_ms);
+  }
 }
 
 void handle_reset_piece_deadline(TorrentHandle &handle, int32_t piece) {
@@ -1175,6 +1205,22 @@ int32_t get_metadata_received_alert_type() {
 
 int32_t get_hash_failed_alert_type() {
   return lt::hash_failed_alert::alert_type;
+}
+
+int32_t get_file_prio_alert_type() {
+  return lt::file_prio_alert::alert_type;
+}
+
+int32_t get_torrent_paused_alert_type() {
+  return lt::torrent_paused_alert::alert_type;
+}
+
+int32_t get_torrent_resumed_alert_type() {
+  return lt::torrent_resumed_alert::alert_type;
+}
+
+int32_t get_file_error_alert_type() {
+  return lt::file_error_alert::alert_type;
 }
 
 } // namespace libtorrent_wrapper

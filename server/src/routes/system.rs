@@ -76,10 +76,10 @@ pub async fn network_info() -> impl IntoResponse {
     let mut interfaces = Vec::new();
     if let Ok(if_addrs) = if_addrs::get_if_addrs() {
         for iface in if_addrs {
-            if !iface.is_loopback() {
-                if let if_addrs::IfAddr::V4(addr) = iface.addr {
-                    interfaces.push(addr.ip.to_string());
-                }
+            if !iface.is_loopback()
+                && let if_addrs::IfAddr::V4(addr) = iface.addr
+            {
+                interfaces.push(addr.ip.to_string());
             }
         }
     }
@@ -458,50 +458,50 @@ pub async fn update_settings(state: &AppState, payload: &Value) -> anyhow::Resul
                 settings.cache_size = n;
             }
         }
-        if let Some(v) = obj.get("cacheRoot") {
-            if let Some(s) = v.as_str() {
-                settings.cache_root = s.to_string();
-            }
+        if let Some(v) = obj.get("cacheRoot")
+            && let Some(s) = v.as_str()
+        {
+            settings.cache_root = s.to_string();
         }
-        if let Some(v) = obj.get("proxyStreamsEnabled") {
-            if let Some(b) = v.as_bool() {
-                settings.proxy_streams_enabled = b;
-            }
+        if let Some(v) = obj.get("proxyStreamsEnabled")
+            && let Some(b) = v.as_bool()
+        {
+            settings.proxy_streams_enabled = b;
         }
-        if let Some(v) = obj.get("btMaxConnections") {
-            if let Some(n) = v.as_u64() {
-                settings.bt_max_connections =
-                    if n == 0 || n >= enginefs::backend::LEGACY_UNLIMITED_BT_MAX_CONNECTIONS {
-                        enginefs::backend::DEFAULT_BT_MAX_CONNECTIONS
-                    } else {
-                        n
-                    };
-            }
+        if let Some(v) = obj.get("btMaxConnections")
+            && let Some(n) = v.as_u64()
+        {
+            settings.bt_max_connections =
+                if n == 0 || n >= enginefs::backend::LEGACY_UNLIMITED_BT_MAX_CONNECTIONS {
+                    enginefs::backend::DEFAULT_BT_MAX_CONNECTIONS
+                } else {
+                    n
+                };
         }
-        if let Some(v) = obj.get("btHandshakeTimeout") {
-            if let Some(n) = v.as_u64() {
-                settings.bt_handshake_timeout = n;
-            }
+        if let Some(v) = obj.get("btHandshakeTimeout")
+            && let Some(n) = v.as_u64()
+        {
+            settings.bt_handshake_timeout = n;
         }
-        if let Some(v) = obj.get("btRequestTimeout") {
-            if let Some(n) = v.as_u64() {
-                settings.bt_request_timeout = n;
-            }
+        if let Some(v) = obj.get("btRequestTimeout")
+            && let Some(n) = v.as_u64()
+        {
+            settings.bt_request_timeout = n;
         }
-        if let Some(v) = obj.get("btDownloadSpeedSoftLimit") {
-            if let Some(n) = v.as_f64() {
-                settings.bt_download_speed_soft_limit = n;
-            }
+        if let Some(v) = obj.get("btDownloadSpeedSoftLimit")
+            && let Some(n) = v.as_f64()
+        {
+            settings.bt_download_speed_soft_limit = n;
         }
-        if let Some(v) = obj.get("btDownloadSpeedHardLimit") {
-            if let Some(n) = v.as_f64() {
-                settings.bt_download_speed_hard_limit = n;
-            }
+        if let Some(v) = obj.get("btDownloadSpeedHardLimit")
+            && let Some(n) = v.as_f64()
+        {
+            settings.bt_download_speed_hard_limit = n;
         }
-        if let Some(v) = obj.get("btMinPeersForStable") {
-            if let Some(n) = v.as_u64() {
-                settings.bt_min_peers_for_stable = n;
-            }
+        if let Some(v) = obj.get("btMinPeersForStable")
+            && let Some(n) = v.as_u64()
+        {
+            settings.bt_min_peers_for_stable = n;
         }
         update_bool_setting(obj, "btEnableDht", &mut settings.bt_enable_dht);
         update_bool_setting(obj, "btEnablePex", &mut settings.bt_enable_pex);
@@ -586,10 +586,10 @@ pub async fn update_settings(state: &AppState, payload: &Value) -> anyhow::Resul
                 settings.remote_https = Some(s.to_string());
             }
         }
-        if let Some(v) = obj.get("autoUpdateEnabled") {
-            if let Some(enabled) = v.as_bool() {
-                settings.auto_update_enabled = enabled;
-            }
+        if let Some(v) = obj.get("autoUpdateEnabled")
+            && let Some(enabled) = v.as_bool()
+        {
+            settings.auto_update_enabled = enabled;
         }
         if let Some(v) = obj.get("updateChannel").and_then(|v| v.as_str()) {
             settings.update_channel = if v.eq_ignore_ascii_case("prerelease") {
@@ -598,15 +598,15 @@ pub async fn update_settings(state: &AppState, payload: &Value) -> anyhow::Resul
                 UpdateChannel::Stable
             };
         }
-        if let Some(v) = obj.get("updateCheckIntervalHours") {
-            if let Some(hours) = v.as_u64() {
-                settings.update_check_interval_hours = hours.max(1);
-            }
+        if let Some(v) = obj.get("updateCheckIntervalHours")
+            && let Some(hours) = v.as_u64()
+        {
+            settings.update_check_interval_hours = hours.max(1);
         }
-        if let Some(v) = obj.get("seedingEnabled") {
-            if let Some(enabled) = v.as_bool() {
-                settings.seeding_enabled = enabled;
-            }
+        if let Some(v) = obj.get("seedingEnabled")
+            && let Some(enabled) = v.as_bool()
+        {
+            settings.seeding_enabled = enabled;
         }
     }
 

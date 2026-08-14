@@ -14,13 +14,16 @@ use crate::tracker_prober::TrackerProber;
 
 use libtorrent_sys::{LibtorrentSession, SessionSettings};
 
+mod alerts;
 mod constants;
 mod disk_stream;
 mod handle;
 mod helpers;
+mod playback;
 mod stream;
 
 pub use handle::LibtorrentTorrentHandle;
+pub use playback::{LibtorrentNetworkPhase, LibtorrentPlaybackPermit, LibtorrentPlaybackStart};
 // pub(crate) use stream::LibtorrentFileStream;
 // Explicitly re-export read_piece_from_disk for legacy/testing if needed, or just use internally
 // Actually mostly internal.
@@ -47,10 +50,8 @@ pub struct LibtorrentBackend {
     piece_waiter: Arc<crate::piece_waiter::PieceWaiterRegistry>,
     /// Pinned metadata-critical (Cues/moov) pieces that out-rank the playback head
     metadata_pins: Arc<crate::metadata_pins::MetadataPinRegistry>,
-    /// Torrent/file metadata inspections already scheduled for this backend lifetime
-    metadata_inspections: Arc<tokio::sync::Mutex<std::collections::HashSet<(String, usize)>>>,
-    /// Torrents whose files have been initialized to priority 0 after metadata arrival.
-    file_priority_initializations: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    alert_hub: Arc<alerts::LibtorrentAlertHub>,
+    playback: Arc<playback::LibtorrentPlaybackCoordinator>,
 }
 
 impl LibtorrentBackend {
@@ -185,13 +186,17 @@ impl LibtorrentBackend {
 
         let piece_waiter = Arc::new(crate::piece_waiter::PieceWaiterRegistry::new());
         let metadata_pins = Arc::new(crate::metadata_pins::MetadataPinRegistry::new());
-        let metadata_inspections =
-            Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
-        let file_priority_initializations =
-            Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
 
+        let session = Arc::new(RwLock::new(session));
+        let alert_hub = Arc::new(alerts::LibtorrentAlertHub::new());
+        let playback = playback::LibtorrentPlaybackCoordinator::new(
+            session.clone(),
+            alert_hub.clone(),
+            storage_mode,
+            config.clone(),
+        );
         let backend = Self {
-            session: Arc::new(RwLock::new(session)),
+            session,
             save_path,
             metadata_path,
             config,
@@ -200,8 +205,8 @@ impl LibtorrentBackend {
             piece_cache,
             piece_waiter,
             metadata_pins,
-            metadata_inspections,
-            file_priority_initializations,
+            alert_hub,
+            playback,
         };
         backend.start_monitor_task();
         Ok(backend)
@@ -260,13 +265,17 @@ impl LibtorrentBackend {
 
         let piece_waiter = Arc::new(crate::piece_waiter::PieceWaiterRegistry::new());
         let metadata_pins = Arc::new(crate::metadata_pins::MetadataPinRegistry::new());
-        let metadata_inspections =
-            Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
-        let file_priority_initializations =
-            Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
 
+        let session = Arc::new(RwLock::new(session));
+        let alert_hub = Arc::new(alerts::LibtorrentAlertHub::new());
+        let playback = playback::LibtorrentPlaybackCoordinator::new(
+            session.clone(),
+            alert_hub.clone(),
+            storage_mode,
+            config.clone(),
+        );
         let backend = Self {
-            session: Arc::new(RwLock::new(session)),
+            session,
             save_path,
             metadata_path,
             config,
@@ -275,8 +284,8 @@ impl LibtorrentBackend {
             piece_cache,
             piece_waiter,
             metadata_pins,
-            metadata_inspections,
-            file_priority_initializations,
+            alert_hub,
+            playback,
         };
         backend.start_monitor_task();
         Ok(backend)
@@ -368,6 +377,8 @@ impl LibtorrentBackend {
         let alert_piece_cache = self.piece_cache.clone();
         let alert_piece_waiter = self.piece_waiter.clone();
         let alert_storage_mode = self.storage_mode;
+        let alert_hub = self.alert_hub.clone();
+        let alert_playback = self.playback.clone();
 
         tokio::spawn(async move {
             // REDUCED to 5ms for instant piece notifications
@@ -380,12 +391,21 @@ impl LibtorrentBackend {
             loop {
                 interval.tick().await;
 
-                let mut s = alert_session.write().await;
-                let alerts = s.pop_alerts();
+                let alerts = {
+                    let mut session = alert_session.write().await;
+                    session.pop_alerts()
+                };
 
-                for alert in alerts {
+                for mut alert in alerts {
+                    // Wake priority, pause, and piece-byte waiters before doing
+                    // cache or observability work. This path never holds the
+                    // native session lock.
+                    alert_hub.dispatch(&mut alert);
+
                     // Hash failures are expected on unhealthy peers; libtorrent re-downloads the piece.
                     if alert.alert_type == hash_failed_alert_type {
+                        alert_playback
+                            .observe_piece_invalidated(&alert.info_hash, alert.piece_index);
                         tracing::warn!(
                             piece = alert.piece_index,
                             info_hash = %alert.info_hash,
@@ -398,10 +418,12 @@ impl LibtorrentBackend {
                     // the Rust cache; disk sessions only need to wake file readers.
                     if alert.alert_type == piece_finished_alert_type && alert.piece_index >= 0 {
                         tracing::info!(
-                            "piece_finished_alert piece={} info_hash={}",
-                            alert.piece_index,
-                            alert.info_hash,
+                            piece = alert.piece_index,
+                            info_hash = %alert.info_hash,
+                            stage = "piece_verified",
+                            "libtorrent verified piece available"
                         );
+                        alert_playback.observe_piece_verified(&alert.info_hash, alert.piece_index);
 
                         if matches!(alert_storage_mode, LibtorrentStorageMode::MemoryOnly) {
                             if !alert.info_hash.is_empty() {
@@ -414,20 +436,18 @@ impl LibtorrentBackend {
                                 alert.piece_index,
                             );
                             if !piece_data.is_empty() {
-                                let info_hash = alert.info_hash.clone();
-                                let piece_idx = alert.piece_index;
-                                let cache = alert_piece_cache.clone();
-                                let waiter = alert_piece_waiter.clone();
-
-                                tokio::spawn(async move {
-                                    cache.put_piece(&info_hash, piece_idx, piece_data).await;
-                                    waiter.notify_piece_finished(&info_hash, piece_idx);
-                                    tracing::info!(
-                                        "Direct-read: Cached piece {} for {}",
-                                        piece_idx,
-                                        info_hash
-                                    );
-                                });
+                                alert_piece_cache.put_piece_now(
+                                    &alert.info_hash,
+                                    alert.piece_index,
+                                    piece_data,
+                                );
+                                alert_piece_waiter
+                                    .notify_piece_finished(&alert.info_hash, alert.piece_index);
+                                tracing::info!(
+                                    "Direct-read: Cached piece {} for {}",
+                                    alert.piece_index,
+                                    alert.info_hash
+                                );
                             } else {
                                 tracing::warn!(
                                     "piece_finished_alert: memory_read_piece_direct returned empty for piece={} info_hash={}",
@@ -450,14 +470,10 @@ impl LibtorrentBackend {
         let session = self.session.clone();
         let metadata_path = self.metadata_path.clone();
         let config = self.config.clone();
-        let file_priority_initializations = self.file_priority_initializations.clone();
         let _save_path = self.save_path.clone();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
-            let mut last_reannounce: std::collections::HashMap<String, std::time::Instant> =
-                std::collections::HashMap::new();
-
             loop {
                 interval.tick().await;
 
@@ -471,6 +487,9 @@ impl LibtorrentBackend {
 
                 for mut handle in handles {
                     let status = handle.status();
+                    if status.is_paused {
+                        continue;
+                    }
 
                     // --- Metadata Initialization Logic ---
                     if status.has_metadata {
@@ -482,39 +501,16 @@ impl LibtorrentBackend {
 
                         // Instant Loading Part 3: Save Metadata to Cache
                         let info_hash = handle.info_hash();
-                        let should_initialize_priorities = {
-                            let mut initialized = file_priority_initializations.lock().await;
-                            initialized.insert(info_hash.clone())
-                        };
-                        if should_initialize_priorities {
-                            let files = handle.files();
-                            for (idx, file) in files.iter().enumerate() {
-                                handle.set_file_priority(idx as i32, 0);
-                                tracing::debug!(
-                                    info_hash = %info_hash,
-                                    file_idx = idx,
-                                    file_path = %file.path,
-                                    "metadata-ready file priority initialized to skip"
-                                );
-                            }
-                            tracing::info!(
-                                info_hash = %info_hash,
-                                file_count = files.len(),
-                                "metadata-ready torrent initialized with all files skipped"
-                            );
-                        }
-
                         let cache_file =
                             metadata_path.join(format!("{}.torrent", info_hash.to_lowercase()));
                         if !cache_file.exists() {
                             let metadata = handle.get_metadata();
-                            if !metadata.is_empty() {
-                                if let Ok(_) = std::fs::write(&cache_file, metadata) {
-                                    tracing::info!(
-                                        "Instant Loading: Saved metadata for {} to cache.",
-                                        info_hash
-                                    );
-                                }
+                            if !metadata.is_empty() && std::fs::write(&cache_file, metadata).is_ok()
+                            {
+                                tracing::info!(
+                                    "Instant Loading: Saved metadata for {} to cache.",
+                                    info_hash
+                                );
                             }
                         }
                     }
@@ -526,48 +522,16 @@ impl LibtorrentBackend {
                     // file priorities per stream; pausing here causes slow startup and
                     // stalls when several torrents are active.
 
-                    // --- PeerSearch Logic ---
-                    {
-                        let mut force = false;
-                        let min_peers = config.peer_search.min as i32;
-                        let num_peers = status.num_peers as i32;
-
-                        let slow_threshold = 2 * 1024 * 1024;
-                        if num_peers < min_peers
-                            || (status.download_rate < slow_threshold
-                                && num_peers < config.peer_search.max as i32)
-                        {
-                            force = true;
-                        }
-
-                        let now = std::time::Instant::now();
-                        let last_announce =
-                            last_reannounce.entry(handle.info_hash()).or_insert(now);
-
-                        let reannounce_interval = if !status.has_metadata {
-                            std::time::Duration::from_secs(10)
-                        } else if status.download_rate < slow_threshold {
-                            std::time::Duration::from_secs(30)
-                        } else {
-                            std::time::Duration::from_secs(60)
-                        };
-
-                        if now.duration_since(*last_announce) > reannounce_interval {
-                            force = true;
-                            *last_announce = now;
-                        }
-
-                        if force {
-                            let _ = handle.force_reannounce();
-                            let _ = handle.force_dht_announce();
-                        }
-                    }
+                    // Tracker/DHT activation and emergency announces are owned by
+                    // the playback coordinator. The session's normal announce
+                    // schedule remains active while downloading; this monitor
+                    // must not race a generation-scoped pause.
 
                     // --- SwarmCap Logic ---
-                    if let Some(max_speed) = config.swarm_cap.max_speed {
-                        if (status.download_rate as f64) > max_speed {
-                            // Limit handling placeholder
-                        }
+                    if let Some(max_speed) = config.swarm_cap.max_speed
+                        && (status.download_rate as f64) > max_speed
+                    {
+                        // Limit handling placeholder
                     }
 
                     // --- Growler Logic ---
@@ -586,21 +550,10 @@ impl LibtorrentBackend {
 
     /// Mark a torrent as latency-sensitive without pausing other active torrents.
     pub async fn focus_torrent(&self, target_info_hash: &str) {
-        let session = self.session.read().await;
-        let torrents = session.get_torrents();
-
-        for status in torrents {
-            if status.info_hash.eq_ignore_ascii_case(target_info_hash) {
-                if let Ok(mut handle) = session.find_torrent(&status.info_hash) {
-                    if status.is_paused {
-                        tracing::info!("Resuming torrent {} for active stream", status.info_hash);
-                        handle.resume();
-                    }
-                    let _ = handle.force_reannounce();
-                    let _ = handle.force_dht_announce();
-                }
-            }
-        }
+        tracing::trace!(
+            info_hash = %target_info_hash,
+            "Ignoring legacy focus request; libtorrent playback coordinator owns activation"
+        );
     }
 
     /// Enable or disable streaming mode
@@ -613,20 +566,9 @@ impl LibtorrentBackend {
 
     /// Resume all paused torrents (called when streaming ends)
     pub async fn resume_all_torrents(&self) {
-        // Disable streaming mode (restore upload bandwidth)
-        self.set_streaming_mode(false).await;
-
-        let session = self.session.read().await;
-        let torrents = session.get_torrents();
-
-        for status in torrents {
-            if status.is_paused {
-                if let Ok(mut handle) = session.find_torrent(&status.info_hash) {
-                    tracing::info!("Resuming torrent {}", status.info_hash);
-                    handle.resume();
-                }
-            }
-        }
+        tracing::trace!(
+            "Ignoring legacy resume-all request; libtorrent playback coordinator owns activation"
+        );
     }
 
     /// Pause all torrents (called when no active streams remain)
@@ -635,11 +577,11 @@ impl LibtorrentBackend {
         let torrents = session.get_torrents();
 
         for status in torrents {
-            if !status.is_paused {
-                if let Ok(mut handle) = session.find_torrent(&status.info_hash) {
-                    tracing::info!("Pausing torrent {} (no active streams)", status.info_hash);
-                    handle.pause();
-                }
+            if !status.is_paused
+                && let Ok(mut handle) = session.find_torrent(&status.info_hash)
+            {
+                tracing::info!("Pausing torrent {} (no active streams)", status.info_hash);
+                handle.pause();
             }
         }
     }
@@ -673,6 +615,8 @@ impl TorrentBackend for LibtorrentBackend {
                             let mut p = params.clone();
                             p.torrent_data = cached_data;
                             p.save_path = save_path;
+                            p.paused = true;
+                            p.auto_managed = false;
                             // Inject known trackers immediately
                             for &t in DEFAULT_TRACKERS {
                                 if !p.trackers.contains(&t.to_string()) {
@@ -705,8 +649,8 @@ impl TorrentBackend for LibtorrentBackend {
                     save_path,
                     name: String::new(),
                     trackers: trackers.clone(),
-                    paused: false,
-                    auto_managed: true,
+                    paused: true,
+                    auto_managed: false,
                     upload_limit: 0,
                     download_limit: 0,
                     sequential_download: false,
@@ -719,14 +663,8 @@ impl TorrentBackend for LibtorrentBackend {
             }
         };
 
-        // Newly added torrents are no longer auto_managed (see
-        // session_add_magnet), so nothing implicitly starts them anymore --
-        // we now own that responsibility. Without this, force_reannounce/
-        // force_dht_announce below are issued against a torrent that was
-        // never actually started, and metadata never arrives.
-        handle.resume();
-
-        // Instant Loading Part 2: Tracker Injection & Force Reannounce
+        // Instant Loading Part 2: tracker injection. The playback coordinator
+        // owns resume and announce ordering.
         let mut final_trackers: Vec<String> = trackers.clone();
         for &t in DEFAULT_TRACKERS {
             if !final_trackers.iter().any(|existing| existing == t) {
@@ -737,10 +675,6 @@ impl TorrentBackend for LibtorrentBackend {
         for tracker in &final_trackers {
             handle.add_tracker(tracker, 0);
         }
-
-        // Force immediate discovery
-        handle.force_reannounce();
-        handle.force_dht_announce();
 
         // Background: Rank trackers and re-apply
         let mut rank_handle = handle.clone();
@@ -760,25 +694,11 @@ impl TorrentBackend for LibtorrentBackend {
             handle.add_tracker(tracker, idx as i32);
         }
 
-        // CRITICAL: Set ALL files to priority 0 (skip) immediately
-        // This prevents downloading all 366 episodes when user only wants 1
-        // The get_file_reader() will set priority 7 for the specific file being streamed
-        let files = handle.files();
-        tracing::info!(
-            "add_torrent: Setting all {} files to priority 0 (skip) to prevent unwanted downloads",
-            files.len()
-        );
-        for (idx, _f) in files.iter().enumerate() {
-            handle.set_file_priority(idx as i32, 0);
-        }
-        if !files.is_empty() {
-            let mut initialized = self.file_priority_initializations.lock().await;
-            initialized.insert(handle.info_hash());
-        }
-
+        let info_hash = handle.info_hash();
+        self.playback.register_torrent(&info_hash).await;
         Ok(LibtorrentTorrentHandle {
             session: self.session.clone(),
-            info_hash: handle.info_hash(),
+            info_hash,
             save_path: self.save_path.clone(),
             config: self.config.clone(),
             storage_mode: self.storage_mode,
@@ -786,8 +706,7 @@ impl TorrentBackend for LibtorrentBackend {
             piece_cache: self.piece_cache.clone(),
             piece_waiter: self.piece_waiter.clone(),
             metadata_pins: self.metadata_pins.clone(),
-            metadata_inspections: self.metadata_inspections.clone(),
-            file_priority_initializations: self.file_priority_initializations.clone(),
+            playback: self.playback.clone(),
         })
     }
 
@@ -804,8 +723,7 @@ impl TorrentBackend for LibtorrentBackend {
                 piece_cache: self.piece_cache.clone(),
                 piece_waiter: self.piece_waiter.clone(),
                 metadata_pins: self.metadata_pins.clone(),
-                metadata_inspections: self.metadata_inspections.clone(),
-                file_priority_initializations: self.file_priority_initializations.clone(),
+                playback: self.playback.clone(),
             }),
             Err(_) => None,
         }
@@ -821,17 +739,10 @@ impl TorrentBackend for LibtorrentBackend {
                 .remove_torrent(&handle, false)
                 .map_err(|e| anyhow!("Failed to remove torrent: {}", e))?;
         }
+        self.playback.remove_torrent(info_hash).await;
 
         self.piece_cache.clear_torrent(info_hash).await;
         self.piece_waiter.clear_torrent(info_hash);
-        {
-            let mut inspections = self.metadata_inspections.lock().await;
-            inspections.retain(|(hash, _)| hash != info_hash);
-        }
-        {
-            let mut initialized = self.file_priority_initializations.lock().await;
-            initialized.remove(info_hash);
-        }
         libtorrent_sys::memory_clear_torrent(info_hash);
         Ok(())
     }
@@ -883,5 +794,9 @@ impl TorrentBackend for LibtorrentBackend {
                 })
                 .collect(),
         }
+    }
+
+    fn set_seeding_enabled(&self, enabled: bool) {
+        self.playback.set_seeding_enabled(enabled);
     }
 }

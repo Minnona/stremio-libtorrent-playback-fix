@@ -15,7 +15,10 @@ fn starts_and_stops_embedded_server() -> anyhow::Result<()> {
     assert_eq!(body["success"], true);
 
     handle.shutdown()?;
-    assert_eq!(handle.join()?, Some(stream_server::ShutdownSource::External));
+    assert_eq!(
+        handle.join()?,
+        Some(stream_server::ShutdownSource::External)
+    );
 
     Ok(())
 }

@@ -53,6 +53,7 @@ mod ssdp;
 mod state;
 mod tui;
 mod updater;
+pub mod ytdlp;
 
 pub use ffmpeg_setup::MissingFfmpegError;
 
@@ -360,8 +361,23 @@ async fn run_inner(
         );
     }
 
-    let mut default_settings = routes::system::ServerSettings::default();
-    default_settings.cache_root = cache_dir.to_string_lossy().to_string();
+    // yt-dlp is only needed for YouTube trailers, but downloading it while a
+    // hover preview waits is very visible. Warming it here off the startup path
+    // means the first trailer usually finds it already installed, and a failure
+    // only costs the trailer rather than the server.
+    {
+        let config_dir = config_dir.clone();
+        tokio::spawn(async move {
+            if let Err(error) = ytdlp::resolve(&config_dir).await {
+                tracing::warn!(%error, "could not prepare yt-dlp; YouTube trailers will be unavailable");
+            }
+        });
+    }
+
+    let default_settings = routes::system::ServerSettings {
+        cache_root: cache_dir.to_string_lossy().to_string(),
+        ..routes::system::ServerSettings::default()
+    };
 
     let settings = AppState::load_settings(&config_dir, &default_settings);
     let settings_arc = Arc::new(tokio::sync::RwLock::new(settings.clone()));
@@ -563,10 +579,10 @@ async fn run_inner(
     }
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel(1);
-    if cfg.use_tui {
-        if let Some(rx) = tui_rx {
-            tui::start_tui(Arc::new(state.clone()), rx, shutdown_tx);
-        }
+    if cfg.use_tui
+        && let Some(rx) = tui_rx
+    {
+        tui::start_tui(Arc::new(state.clone()), rx, shutdown_tx);
     }
 
     fn peer_from_request(req: &axum::extract::Request) -> Option<SocketAddr> {
@@ -722,7 +738,7 @@ async fn run_inner(
                 tracing::info_span!(
                     "request",
                     method = %request.method(),
-                    uri = %request.uri(),
+                    path = request.uri().path(),
                 )
             }),
         )

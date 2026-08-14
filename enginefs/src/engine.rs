@@ -8,10 +8,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 use tokio::io::AsyncSeekExt;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 
 use crate::files::FileHandle;
 use regex::Regex;
+
+type ProbeCell = Arc<OnceCell<Result<crate::hls::ProbeResult, String>>>;
+type ProbeInflight = HashMap<usize, ProbeCell>;
+type OpensubHashCell = Arc<OnceCell<Result<String, String>>>;
+type OpensubHashInflight = HashMap<usize, OpensubHashCell>;
 
 #[derive(serde::Deserialize, serde::Serialize)]
 pub struct SeriesInfo {
@@ -25,6 +30,9 @@ pub struct Engine<H: TorrentHandle> {
     pub last_accessed: AtomicU64,
     pub active_streams: Arc<AtomicUsize>,
     pub probe_cache: Mutex<HashMap<usize, crate::hls::ProbeResult>>,
+    probe_inflight: Mutex<ProbeInflight>,
+    opensub_hash_cache: Mutex<HashMap<usize, String>>,
+    opensub_hash_inflight: Mutex<OpensubHashInflight>,
     pub data_cache: DataCache,
     /// Whether this torrent was paused by the idle seeding-disabled policy.
     /// A new playback request resumes it before making a file wanted.
@@ -39,6 +47,9 @@ impl<H: TorrentHandle> Engine<H> {
             last_accessed: AtomicU64::new(crate::now_secs()),
             active_streams: Arc::new(AtomicUsize::new(0)),
             probe_cache: Mutex::new(HashMap::new()),
+            probe_inflight: Mutex::new(HashMap::new()),
+            opensub_hash_cache: Mutex::new(HashMap::new()),
+            opensub_hash_inflight: Mutex::new(HashMap::new()),
             data_cache: moka::future::Cache::builder()
                 .weigher(|_key, value: &Arc<Vec<u8>>| value.len() as u32)
                 .max_capacity(64 * 1024 * 1024) // 64MB cache per engine
@@ -57,12 +68,6 @@ impl<H: TorrentHandle> Engine<H> {
         file_idx: usize,
         fallback_url: &str,
     ) -> anyhow::Result<crate::hls::ProbeResult> {
-        let startup = Instant::now();
-        tracing::info!(
-            "[HLS STREAMING] Preparing file {} for HLS playback",
-            file_idx
-        );
-
         let cache = self.probe_cache.lock().await;
         if let Some(res) = cache.get(&file_idx) {
             if res.is_hls_ready() {
@@ -81,26 +86,84 @@ impl<H: TorrentHandle> Engine<H> {
         }
         drop(cache); // Release lock before potentially slow operations
 
-        let prepare_start = Instant::now();
-        self.handle.prepare_file_for_streaming(file_idx).await?;
-        tracing::info!(
-            "startup: prepare_file_for_streaming completed in {:?} for probe file {}",
-            prepare_start.elapsed(),
+        let inflight = {
+            let mut probes = self.probe_inflight.lock().await;
+            probes
+                .entry(file_idx)
+                .or_insert_with(|| Arc::new(OnceCell::new()))
+                .clone()
+        };
+        let result = inflight
+            .get_or_init(|| async {
+                self.run_probe(file_idx, fallback_url)
+                    .await
+                    .map_err(|error| format!("{error:#}"))
+            })
+            .await
+            .clone();
+        {
+            let mut probes = self.probe_inflight.lock().await;
+            if probes
+                .get(&file_idx)
+                .is_some_and(|current| Arc::ptr_eq(current, &inflight))
+            {
+                probes.remove(&file_idx);
+            }
+        }
+        let res = result.map_err(anyhow::Error::msg)?;
+
+        if res.is_hls_ready() {
+            let mut cache = self.probe_cache.lock().await;
+            cache.insert(file_idx, res.clone());
+        }
+        Ok(res)
+    }
+
+    async fn run_probe(
+        &self,
+        file_idx: usize,
+        fallback_url: &str,
+    ) -> anyhow::Result<crate::hls::ProbeResult> {
+        let startup = Instant::now();
+        tracing::debug!(
+            "[HLS STREAMING] Preparing file {} for HLS playback",
             file_idx
         );
 
-        let (probe_path, probe_source) =
+        let native_lifecycle = self.handle.manages_playback_lifecycle();
+        if !native_lifecycle {
+            let prepare_start = Instant::now();
+            self.handle.prepare_file_for_streaming(file_idx).await?;
+            tracing::info!(
+                "startup: prepare_file_for_streaming completed in {:?} for probe file {}",
+                prepare_start.elapsed(),
+                file_idx
+            );
+        }
+
+        let can_probe_local = !native_lifecycle || self.handle.is_file_complete(file_idx).await;
+        let (probe_path, probe_source) = if can_probe_local {
             if let Some(local_path) = self.handle.get_file_path(file_idx).await {
                 tracing::info!("Probing via local file path: {}", local_path);
                 (local_path, "local-file")
             } else {
-                tracing::info!("Probing via HTTP URL (fallback): {}", fallback_url);
+                tracing::debug!(
+                    path = fallback_url.split('?').next().unwrap_or(fallback_url),
+                    "Probing via HTTP fallback"
+                );
                 (fallback_url.to_string(), "stream-url")
-            };
+            }
+        } else {
+            tracing::info!(
+                file_idx,
+                "Incomplete libtorrent file will be probed through the loopback stream"
+            );
+            (fallback_url.to_string(), "stream-url")
+        };
 
         let probe_start = Instant::now();
         let mut res = crate::hls::HlsEngine::probe_video(&probe_path).await?;
-        tracing::info!(
+        tracing::debug!(
             "startup: probe finished in {:?} via {} (streams={}, duration={:.2}s, total={:?})",
             probe_start.elapsed(),
             probe_source,
@@ -128,11 +191,7 @@ impl<H: TorrentHandle> Engine<H> {
             res = stream_res;
         }
 
-        if res.is_hls_ready() {
-            // Re-acquire cache lock to store result.
-            let mut cache = self.probe_cache.lock().await;
-            cache.insert(file_idx, res.clone());
-        } else {
+        if !res.is_hls_ready() {
             tracing::warn!(
                 file_idx,
                 streams = res.streams.len(),
@@ -281,7 +340,7 @@ impl<H: TorrentHandle> Engine<H> {
         intent: PlaybackIntent,
     ) -> Option<FileHandle<H>> {
         let startup = Instant::now();
-        tracing::info!(
+        tracing::debug!(
             "[STREAMING] Preparing file {} for playback (offset={}, intent={:?})",
             file_idx,
             start_offset,
@@ -318,7 +377,8 @@ impl<H: TorrentHandle> Engine<H> {
             );
         }
 
-        if priority != 255
+        if !self.handle.manages_playback_lifecycle()
+            && priority != 255
             && start_offset == 0
             && matches!(
                 intent,
@@ -357,7 +417,7 @@ impl<H: TorrentHandle> Engine<H> {
             )
             .await
             .ok()?;
-        tracing::info!(
+        tracing::debug!(
             "startup: get_file_reader returned in {:?} for file {} offset {} (total={:?})",
             reader_start.elapsed(),
             file_idx,
@@ -373,6 +433,54 @@ impl<H: TorrentHandle> Engine<H> {
     }
 
     pub async fn get_opensub_hash(self: &Arc<Self>, file_idx: usize) -> anyhow::Result<String> {
+        if !self.handle.manages_playback_lifecycle() {
+            return self.calculate_opensub_hash(file_idx).await;
+        }
+        if let Some(hash) = self.opensub_hash_cache.lock().await.get(&file_idx).cloned() {
+            return Ok(hash);
+        }
+
+        let inflight = {
+            let mut hashes = self.opensub_hash_inflight.lock().await;
+            hashes
+                .entry(file_idx)
+                .or_insert_with(|| Arc::new(OnceCell::new()))
+                .clone()
+        };
+        let result = inflight
+            .get_or_init(|| async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(15),
+                    self.calculate_opensub_hash(file_idx),
+                )
+                .await
+                .map_err(|_| "OpenSub hash reader timed out after 15 seconds".to_string())?
+                .map_err(|error| format!("{error:#}"))
+            })
+            .await
+            .clone();
+        {
+            let mut hashes = self.opensub_hash_inflight.lock().await;
+            if hashes
+                .get(&file_idx)
+                .is_some_and(|current| Arc::ptr_eq(current, &inflight))
+            {
+                hashes.remove(&file_idx);
+            }
+        }
+        match result {
+            Ok(hash) => {
+                self.opensub_hash_cache
+                    .lock()
+                    .await
+                    .insert(file_idx, hash.clone());
+                Ok(hash)
+            }
+            Err(error) => Err(anyhow::anyhow!(error)),
+        }
+    }
+
+    async fn calculate_opensub_hash(self: &Arc<Self>, file_idx: usize) -> anyhow::Result<String> {
         let files = self.handle.get_files().await;
         if file_idx >= files.len() {
             return Err(anyhow::anyhow!("File not found"));
@@ -427,19 +535,17 @@ impl<H: TorrentHandle> Engine<H> {
         for (idx, file) in files.iter().enumerate() {
             let filename = file.name.clone();
             let path = std::path::PathBuf::from(&filename);
-            if let Some(ext) = path.extension() {
-                if let Some(ext_str) = ext.to_str() {
-                    let ext_lower = ext_str.to_lowercase();
-                    if ["srt", "vtt", "sub", "idx", "txt", "ssa", "ass"]
-                        .contains(&ext_lower.as_str())
-                    {
-                        tracing::info!("[SUBTITLES] Found external subtitle: {}", filename);
-                        tracks.push(SubtitleTrack {
-                            id: idx,
-                            name: filename,
-                            size: file.length,
-                        });
-                    }
+            if let Some(ext) = path.extension()
+                && let Some(ext_str) = ext.to_str()
+            {
+                let ext_lower = ext_str.to_lowercase();
+                if ["srt", "vtt", "sub", "idx", "txt", "ssa", "ass"].contains(&ext_lower.as_str()) {
+                    tracing::info!("[SUBTITLES] Found external subtitle: {}", filename);
+                    tracks.push(SubtitleTrack {
+                        id: idx,
+                        name: filename,
+                        size: file.length,
+                    });
                 }
             }
         }

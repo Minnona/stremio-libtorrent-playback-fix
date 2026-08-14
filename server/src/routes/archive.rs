@@ -316,15 +316,15 @@ async fn create_session_internal(
         },
     );
 
-    if method == Method::GET {
-        if let Some(file) = selected_file {
-            return Redirect::temporary(&format!(
-                "./stream/{}/{}",
-                urlencoding::encode(&key),
-                encode_path_segments(&file)
-            ))
-            .into_response();
-        }
+    if method == Method::GET
+        && let Some(file) = selected_file
+    {
+        return Redirect::temporary(&format!(
+            "./stream/{}/{}",
+            urlencoding::encode(&key),
+            encode_path_segments(&file)
+        ))
+        .into_response();
     }
 
     Json(CreateResponse { key }).into_response()
@@ -401,7 +401,7 @@ async fn stream_file(
         // EngineFS uses string info_hash
         // let sha_hash = crate::engine::SHA1::from_hex(&hash_part).map_err(|_| StatusCode::BAD_REQUEST)?;
 
-        if let Some(engine_instance) = engine.get_engine(&hash_part).await {
+        if let Some(engine_instance) = engine.get_engine(hash_part).await {
             // engine_instance is Arc<Engine<H>>
             // We need to find the file inside this engine.
             // Engine has `handle`.
@@ -552,12 +552,12 @@ async fn stream_file(
     let mut end = file_size.saturating_sub(1);
     let mut is_partial = false;
 
-    if let Some(range_header) = headers.get(header::RANGE).and_then(|h| h.to_str().ok()) {
-        if let Some(parsed) = parse_range(range_header, file_size) {
-            start = parsed.0;
-            end = parsed.1;
-            is_partial = true;
-        }
+    if let Some(range_header) = headers.get(header::RANGE).and_then(|h| h.to_str().ok())
+        && let Some(parsed) = parse_range(range_header, file_size)
+    {
+        start = parsed.0;
+        end = parsed.1;
+        is_partial = true;
     }
 
     // Seek to start

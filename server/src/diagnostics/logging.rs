@@ -123,7 +123,7 @@ pub fn direct_stream_started() {
 
 pub fn direct_stream_ended() {
     ACTIVE_DIRECT_STREAMS
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
             Some(count.saturating_sub(1))
         })
         .ok();
@@ -331,7 +331,7 @@ unsafe extern "system" fn windows_exception_filter(
         ));
 
         if let Ok(file) = std::fs::File::create(&path) {
-            let mut exception = MINIDUMP_EXCEPTION_INFORMATION {
+            let exception = MINIDUMP_EXCEPTION_INFORMATION {
                 ThreadId: unsafe { GetCurrentThreadId() },
                 ExceptionPointers: exception_info as *mut _,
                 ClientPointers: false.into(),
@@ -347,7 +347,7 @@ unsafe extern "system" fn windows_exception_filter(
                     GetCurrentProcessId(),
                     HANDLE(file.as_raw_handle()),
                     dump_type,
-                    Some(&mut exception),
+                    Some(&exception),
                     None,
                     None,
                 )

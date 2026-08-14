@@ -123,6 +123,9 @@ int32_t handle_get_upload_limit(TorrentHandle const &handle);
 int32_t handle_get_download_limit(TorrentHandle const &handle);
 void handle_force_recheck(TorrentHandle &handle);
 void handle_force_reannounce(TorrentHandle &handle);
+void handle_force_reannounce_with_flags(TorrentHandle &handle,
+                                        bool high_priority,
+                                        bool ignore_min_interval);
 void handle_force_dht_announce(TorrentHandle &handle);
 void handle_flush_cache(TorrentHandle &handle);
 
@@ -131,6 +134,9 @@ void handle_set_sequential_download(TorrentHandle &handle, bool enable);
 bool handle_is_sequential_download(TorrentHandle const &handle);
 void handle_set_piece_deadline(TorrentHandle &handle, int32_t piece,
                                int32_t deadline_ms);
+void handle_set_piece_deadline_with_alert(TorrentHandle &handle, int32_t piece,
+                                          int32_t deadline_ms,
+                                          bool alert_when_available);
 void handle_reset_piece_deadline(TorrentHandle &handle, int32_t piece);
 void handle_clear_piece_deadlines(TorrentHandle &handle);
 
@@ -183,6 +189,10 @@ int32_t get_piece_finished_alert_type();
 int32_t get_read_piece_alert_type();
 int32_t get_metadata_received_alert_type();
 int32_t get_hash_failed_alert_type();
+int32_t get_file_prio_alert_type();
+int32_t get_torrent_paused_alert_type();
+int32_t get_torrent_resumed_alert_type();
+int32_t get_file_error_alert_type();
 
 // Direct memory piece read — bypasses libtorrent's read_piece()
 rust::Vec<uint8_t> memory_read_piece_direct(rust::Str info_hash, int32_t piece);

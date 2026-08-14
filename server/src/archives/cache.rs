@@ -119,13 +119,13 @@ impl AsyncWrite for CacheWriter {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let poll = Pin::new(&mut self.file).poll_write(cx, buf);
-        if let Poll::Ready(Ok(n)) = poll {
-            if n > 0 {
-                self.state_tx.send_modify(|state| {
-                    state.written_bytes += n as u64;
-                });
-                self.notify.notify_waiters();
-            }
+        if let Poll::Ready(Ok(n)) = poll
+            && n > 0
+        {
+            self.state_tx.send_modify(|state| {
+                state.written_bytes += n as u64;
+            });
+            self.notify.notify_waiters();
         }
         poll
     }
@@ -229,7 +229,7 @@ impl AsyncRead for ProgressiveReader {
 
             // Check errors
             if let Some(err) = current_state.error {
-                return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, err)));
+                return Poll::Ready(Err(io::Error::other(err)));
             }
 
             // Check if data available
@@ -237,10 +237,8 @@ impl AsyncRead for ProgressiveReader {
                 let available = current_state.written_bytes - self.pos;
                 let needed = buf.remaining().min(available as usize);
 
-                if needed == 0 {
-                    if buf.remaining() == 0 {
-                        return Poll::Ready(Ok(()));
-                    }
+                if needed == 0 && buf.remaining() == 0 {
+                    return Poll::Ready(Ok(()));
                 }
 
                 // Read from file
@@ -301,7 +299,7 @@ impl AsyncSeek for ProgressiveReader {
             io::SeekFrom::End(p) => {
                 if let Some(total) = self.total_size {
                     if p < 0 {
-                        total.saturating_sub(p.abs() as u64)
+                        total.saturating_sub(p.unsigned_abs())
                     } else {
                         total + p as u64
                     }

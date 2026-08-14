@@ -9,7 +9,6 @@ use std::ptr;
 use crate::error::{RarError, Result};
 
 use crate::ffi;
-use autocxx;
 
 // Callback function for UnRAR
 extern "C" fn rar_callback(msg: u32, user_data: isize, p1: isize, p2: isize) -> i32 {

@@ -90,10 +90,8 @@ pub async fn proxy_handler(
         Err(_) => return (StatusCode::BAD_REQUEST, "Invalid target URL").into_response(),
     };
 
-    if is_path_format {
-        if let Some(q) = raw_query {
-            url.set_query(Some(&q));
-        }
+    if is_path_format && let Some(q) = raw_query {
+        url.set_query(Some(&q));
     }
 
     let client = Client::builder()

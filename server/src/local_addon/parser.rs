@@ -69,24 +69,23 @@ pub fn parse_filename(path: &Path) -> Option<VideoMetadata> {
         return None;
     }
 
-    let mut meta = VideoMetadata::default();
-    meta.type_ = "other".to_string();
+    let mut meta = VideoMetadata {
+        type_: "other".to_string(),
+        ..VideoMetadata::default()
+    };
 
-    let clean_name = filename
-        .replace('.', " ")
-        .replace('_', " ")
-        .replace('-', " ");
+    let clean_name = filename.replace(['.', '_', '-'], " ");
 
-    if let Some(caps) = get_year_regex().find(&clean_name) {
-        if let Ok(year) = caps.as_str().parse::<i32>() {
-            meta.year = Some(year);
-        }
+    if let Some(caps) = get_year_regex().find(&clean_name)
+        && let Ok(year) = caps.as_str().parse::<i32>()
+    {
+        meta.year = Some(year);
     }
 
-    if let Some(caps) = get_season_regex().captures(&clean_name) {
-        if let Some(s) = caps.get(1) {
-            meta.season = s.as_str().parse::<i32>().ok();
-        }
+    if let Some(caps) = get_season_regex().captures(&clean_name)
+        && let Some(s) = caps.get(1)
+    {
+        meta.season = s.as_str().parse::<i32>().ok();
     }
 
     let mut episodes = Vec::new();
@@ -97,10 +96,10 @@ pub fn parse_filename(path: &Path) -> Option<VideoMetadata> {
         if !has_episode_prefix(&clean_name, episode_match.start()) {
             continue;
         }
-        if let Some(e) = caps.get(1) {
-            if let Ok(ep) = e.as_str().parse::<i32>() {
-                episodes.push(ep);
-            }
+        if let Some(e) = caps.get(1)
+            && let Ok(ep) = e.as_str().parse::<i32>()
+        {
+            episodes.push(ep);
         }
     }
     if !episodes.is_empty() {
@@ -134,8 +133,7 @@ pub fn parse_filename(path: &Path) -> Option<VideoMetadata> {
             path.file_stem()?
                 .to_str()?
                 .to_string()
-                .replace('.', " ")
-                .replace('_', " "),
+                .replace(['.', '_'], " "),
         );
     }
 

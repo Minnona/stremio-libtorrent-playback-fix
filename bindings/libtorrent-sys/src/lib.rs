@@ -446,6 +446,11 @@ mod ffi {
         fn handle_get_download_limit(handle: &TorrentHandle) -> i32;
         fn handle_force_recheck(handle: Pin<&mut TorrentHandle>);
         fn handle_force_reannounce(handle: Pin<&mut TorrentHandle>);
+        fn handle_force_reannounce_with_flags(
+            handle: Pin<&mut TorrentHandle>,
+            high_priority: bool,
+            ignore_min_interval: bool,
+        );
         fn handle_force_dht_announce(handle: Pin<&mut TorrentHandle>);
         fn handle_flush_cache(handle: Pin<&mut TorrentHandle>);
 
@@ -455,6 +460,12 @@ mod ffi {
         fn handle_set_sequential_download(handle: Pin<&mut TorrentHandle>, enable: bool);
         fn handle_is_sequential_download(handle: &TorrentHandle) -> bool;
         fn handle_set_piece_deadline(handle: Pin<&mut TorrentHandle>, piece: i32, deadline_ms: i32);
+        fn handle_set_piece_deadline_with_alert(
+            handle: Pin<&mut TorrentHandle>,
+            piece: i32,
+            deadline_ms: i32,
+            alert_when_available: bool,
+        );
         fn handle_reset_piece_deadline(handle: Pin<&mut TorrentHandle>, piece: i32);
         fn handle_clear_piece_deadlines(handle: Pin<&mut TorrentHandle>);
 
@@ -515,6 +526,10 @@ mod ffi {
         fn get_read_piece_alert_type() -> i32;
         fn get_metadata_received_alert_type() -> i32;
         fn get_hash_failed_alert_type() -> i32;
+        fn get_file_prio_alert_type() -> i32;
+        fn get_torrent_paused_alert_type() -> i32;
+        fn get_torrent_resumed_alert_type() -> i32;
+        fn get_file_error_alert_type() -> i32;
 
         /// Read piece data directly from memory storage, bypassing libtorrent's
         /// internal read_piece() which fails with custom disk interfaces.
@@ -738,6 +753,22 @@ impl LibtorrentHandle {
         ffi::handle_set_piece_deadline(self.inner.pin_mut(), piece, deadline_ms)
     }
 
+    /// Set a streaming deadline and optionally request a `read_piece_alert`
+    /// containing the piece bytes as soon as the piece becomes available.
+    pub fn set_piece_deadline_with_alert(
+        &mut self,
+        piece: i32,
+        deadline_ms: i32,
+        alert_when_available: bool,
+    ) {
+        ffi::handle_set_piece_deadline_with_alert(
+            self.inner.pin_mut(),
+            piece,
+            deadline_ms,
+            alert_when_available,
+        );
+    }
+
     /// Reset piece deadline
     pub fn reset_piece_deadline(&mut self, piece: i32) {
         ffi::handle_reset_piece_deadline(self.inner.pin_mut(), piece)
@@ -783,6 +814,13 @@ impl LibtorrentHandle {
         ffi::handle_set_file_priority(self.inner.pin_mut(), index, priority)
     }
 
+    /// Set all file priorities in one asynchronous libtorrent operation.
+    ///
+    /// Completion is reported through `file_prio_alert`.
+    pub fn set_file_priorities(&mut self, priorities: &[i32]) {
+        ffi::handle_set_file_priorities(self.inner.pin_mut(), priorities)
+    }
+
     /// Get file priorities
     pub fn get_file_priorities(&self) -> Vec<i32> {
         ffi::handle_get_file_priorities(&self.inner)
@@ -816,6 +854,15 @@ impl LibtorrentHandle {
     /// Force reannounce
     pub fn force_reannounce(&mut self) {
         ffi::handle_force_reannounce(self.inner.pin_mut())
+    }
+
+    /// Force a tracker announce with libtorrent's reannounce flags.
+    pub fn force_reannounce_with_flags(&mut self, high_priority: bool, ignore_min_interval: bool) {
+        ffi::handle_force_reannounce_with_flags(
+            self.inner.pin_mut(),
+            high_priority,
+            ignore_min_interval,
+        )
     }
 
     /// Force DHT announce

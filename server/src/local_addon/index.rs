@@ -45,10 +45,7 @@ impl LocalIndex {
 
         item.id = key.clone();
 
-        items
-            .entry(key.clone())
-            .or_insert_with(Vec::new)
-            .push(item.clone());
+        items.entry(key.clone()).or_default().push(item.clone());
 
         let mut paths = self.path_map.write().unwrap();
         paths.insert(item.path.clone(), key);

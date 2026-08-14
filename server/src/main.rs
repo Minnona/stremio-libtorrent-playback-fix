@@ -42,7 +42,8 @@ mod app {
         let no_tray = args.iter().any(|a| a == "--no-tray");
         let use_tui = args.iter().any(|a| a == "--tui");
         let is_release = !cfg!(debug_assertions);
-        let silent_mode = !no_tray && (args.iter().any(|a| a == "--silent") || !attached_console || is_release);
+        let silent_mode =
+            !no_tray && (args.iter().any(|a| a == "--silent") || !attached_console || is_release);
 
         let result = if silent_mode {
             run_tray_mode(use_tui)

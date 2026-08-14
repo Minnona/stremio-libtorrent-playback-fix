@@ -41,7 +41,6 @@ async_zip = { version = "0.0.18", features = ["deflate", "tokio"] }
 base64 = "0.22.1"
 walkdir = "2.5.0"
 url = "2.5.7"
-rusty_ytdl = "0.7.4"
 mime_guess = "2.0.5"
 async-rar = { path = "../bindings/async-rar" }
 lz-str = "0.2.1"

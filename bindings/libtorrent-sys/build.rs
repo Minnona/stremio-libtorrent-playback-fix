@@ -77,8 +77,14 @@ fn find_libtorrent() -> (Vec<std::path::PathBuf>, bool) {
     // Configure vcpkg crate
     let triplet_env = std::env::var("VCPKGRS_TRIPLET").ok();
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    let default_triplet = if target_os == "windows" {
+    let target_features = std::env::var("CARGO_CFG_TARGET_FEATURE").unwrap_or_default();
+    let static_crt = target_features
+        .split(',')
+        .any(|feature| feature == "crt-static");
+    let default_triplet = if target_os == "windows" && static_crt {
         "x64-windows-static"
+    } else if target_os == "windows" {
+        "x64-windows-static-md"
     } else {
         "x64-linux"
     };

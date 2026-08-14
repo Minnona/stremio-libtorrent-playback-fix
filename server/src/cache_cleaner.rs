@@ -231,7 +231,7 @@ async fn clean_cache(state: &Arc<AppState>) -> anyhow::Result<()> {
         );
 
         // Sort by modification time (oldest first)
-        files.sort_by(|a, b| a.2.cmp(&b.2));
+        files.sort_by_key(|a| a.2);
 
         let mut deleted_count = 0;
         let mut freed_space = 0;
@@ -257,10 +257,10 @@ async fn clean_cache(state: &Arc<AppState>) -> anyhow::Result<()> {
                 freed_space += size;
                 deleted_count += 1;
 
-                if let Some(parent) = path.parent() {
-                    if let Some(root) = download_dirs.iter().find(|root| path.starts_with(root)) {
-                        remove_empty_parents(parent, root).await;
-                    }
+                if let Some(parent) = path.parent()
+                    && let Some(root) = download_dirs.iter().find(|root| path.starts_with(root))
+                {
+                    remove_empty_parents(parent, root).await;
                 }
             }
         }

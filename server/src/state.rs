@@ -126,33 +126,31 @@ impl AppState {
     ) -> ServerSettings {
         let settings_path = config_dir.join("settings.json");
 
-        if settings_path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&settings_path) {
-                if let Ok(mut settings) = serde_json::from_str::<ServerSettings>(&content) {
-                    tracing::info!("Loaded settings from {:?}", settings_path);
-                    // Ensure the cache_root in the loaded settings matches what we expect from runtime?
-                    // Or do we respect the file?
-                    // User might have customized it in the file.
-                    // If it's the default value (empty or old default), maybe update it?
-                    // For now, let's respect the file, but if missing/empty, use our runtime defaults.
-                    if settings.cache_root.is_empty() {
-                        settings.cache_root = defaults.cache_root.clone();
-                    }
-                    if settings.bt_max_connections == 0
-                        || settings.bt_max_connections
-                            >= enginefs::backend::LEGACY_UNLIMITED_BT_MAX_CONNECTIONS
-                    {
-                        tracing::info!(
-                            previous_bt_max_connections = settings.bt_max_connections,
-                            normalized_bt_max_connections =
-                                enginefs::backend::DEFAULT_BT_MAX_CONNECTIONS,
-                            "Normalizing legacy torrent connection setting for multi-client stability"
-                        );
-                        settings.bt_max_connections = enginefs::backend::DEFAULT_BT_MAX_CONNECTIONS;
-                    }
-                    return settings;
-                }
+        if settings_path.exists()
+            && let Ok(content) = std::fs::read_to_string(&settings_path)
+            && let Ok(mut settings) = serde_json::from_str::<ServerSettings>(&content)
+        {
+            tracing::info!("Loaded settings from {:?}", settings_path);
+            // Ensure the cache_root in the loaded settings matches what we expect from runtime?
+            // Or do we respect the file?
+            // User might have customized it in the file.
+            // If it's the default value (empty or old default), maybe update it?
+            // For now, let's respect the file, but if missing/empty, use our runtime defaults.
+            if settings.cache_root.is_empty() {
+                settings.cache_root = defaults.cache_root.clone();
             }
+            if settings.bt_max_connections == 0
+                || settings.bt_max_connections
+                    >= enginefs::backend::LEGACY_UNLIMITED_BT_MAX_CONNECTIONS
+            {
+                tracing::info!(
+                    previous_bt_max_connections = settings.bt_max_connections,
+                    normalized_bt_max_connections = enginefs::backend::DEFAULT_BT_MAX_CONNECTIONS,
+                    "Normalizing legacy torrent connection setting for multi-client stability"
+                );
+                settings.bt_max_connections = enginefs::backend::DEFAULT_BT_MAX_CONNECTIONS;
+            }
+            return settings;
         }
 
         tracing::info!("Using default settings");
@@ -243,11 +241,11 @@ impl enginefs::TrackerStorage for TrackerStorageBridge {
             drop(guard);
 
             // Ensure parent directory exists
-            if let Some(parent) = settings_path.parent() {
-                if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                    tracing::error!("Failed to create settings directory: {}", e);
-                    return;
-                }
+            if let Some(parent) = settings_path.parent()
+                && let Err(e) = tokio::fs::create_dir_all(parent).await
+            {
+                tracing::error!("Failed to create settings directory: {}", e);
+                return;
             }
 
             if let Err(e) = tokio::fs::write(&settings_path, json).await {

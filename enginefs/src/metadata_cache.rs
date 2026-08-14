@@ -75,12 +75,12 @@ impl MetadataCache {
     /// Update just the keyframe offsets for a file
     pub fn update_keyframes(&self, info_hash: &str, file_index: usize, keyframes: Vec<u64>) {
         let key = (info_hash.to_string(), file_index);
-        if let Ok(mut cache) = self.cache.write() {
-            if let Some(existing) = cache.get(&key) {
-                let mut updated = (**existing).clone();
-                updated.keyframe_offsets = keyframes;
-                cache.insert(key, Arc::new(updated));
-            }
+        if let Ok(mut cache) = self.cache.write()
+            && let Some(existing) = cache.get(&key)
+        {
+            let mut updated = (**existing).clone();
+            updated.keyframe_offsets = keyframes;
+            cache.insert(key, Arc::new(updated));
         }
     }
 

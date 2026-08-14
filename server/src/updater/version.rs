@@ -3,15 +3,11 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub enum UpdateChannel {
+    #[default]
     Stable,
     Prerelease,
-}
-
-impl Default for UpdateChannel {
-    fn default() -> Self {
-        Self::Stable
-    }
 }
 
 pub fn current_version() -> Version {
@@ -89,7 +85,7 @@ pub fn is_newer(candidate: &Version, current: &Version) -> bool {
 /// Split `"1.2.3.4-beta.1"` into `("1.2.3.4", Some("beta.1"))`.
 fn split_suffix(s: &str) -> (&str, Option<&str>) {
     // Walk past all digits-and-dots to find the first '-' or '+'.
-    if let Some(pos) = s.find(|c: char| c == '-' || c == '+') {
+    if let Some(pos) = s.find(['-', '+']) {
         (&s[..pos], Some(&s[pos + 1..]))
     } else {
         (s, None)
@@ -97,10 +93,10 @@ fn split_suffix(s: &str) -> (&str, Option<&str>) {
 }
 
 fn apply_suffix(v: &mut Version, suffix: Option<&str>) {
-    if let Some(s) = suffix {
-        if let Ok(pre) = semver::Prerelease::new(s) {
-            v.pre = pre;
-        }
+    if let Some(s) = suffix
+        && let Ok(pre) = semver::Prerelease::new(s)
+    {
+        v.pre = pre;
     }
 }
 

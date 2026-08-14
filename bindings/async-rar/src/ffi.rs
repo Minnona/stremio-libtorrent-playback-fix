@@ -1,4 +1,6 @@
 //! FFI bindings for UnRAR library using autocxx
+
+#![allow(clippy::module_inception, clippy::upper_case_acronyms)]
 #![allow(dead_code)]
 #![allow(unsafe_op_in_unsafe_fn)]
 #![allow(unused_imports)]

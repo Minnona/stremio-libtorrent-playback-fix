@@ -63,14 +63,14 @@ impl TranscodeConfig {
     }
 
     pub fn force_software_encoder(&mut self, reason: &str) {
-        if let Some(hw) = self.hwaccel.as_ref() {
-            if hw.is_hardware() {
-                tracing::warn!(
-                    encoder = %hw.encoder,
-                    reason = %reason,
-                    "Falling back to software HLS encoder"
-                );
-            }
+        if let Some(hw) = self.hwaccel.as_ref()
+            && hw.is_hardware()
+        {
+            tracing::warn!(
+                encoder = %hw.encoder,
+                reason = %reason,
+                "Falling back to software HLS encoder"
+            );
         }
         self.hwaccel = Some(HwAccelConfig::software());
         self.video_bitrate = "8M".to_string();
@@ -255,16 +255,16 @@ impl HlsEngine {
         while let Ok(Some(line)) = reader.next_line().await {
             let line = line.trim();
 
-            if let Some(caps) = re_input.captures(line) {
-                if let Some(formats) = caps.get(1) {
-                    let fmts = formats.as_str().to_lowercase();
-                    if fmts.contains("mp4") {
-                        container = "mp4".to_string();
-                    } else if fmts.contains("matroska") {
-                        container = "matroska".to_string();
-                    } else {
-                        container = fmts.split(',').next().unwrap_or("unknown").to_string();
-                    }
+            if let Some(caps) = re_input.captures(line)
+                && let Some(formats) = caps.get(1)
+            {
+                let fmts = formats.as_str().to_lowercase();
+                if fmts.contains("mp4") {
+                    container = "mp4".to_string();
+                } else if fmts.contains("matroska") {
+                    container = "matroska".to_string();
+                } else {
+                    container = fmts.split(',').next().unwrap_or("unknown").to_string();
                 }
             }
 
@@ -552,14 +552,12 @@ impl HlsEngine {
             false
         };
 
-        if use_hw_decoding {
-            if let Some(ref hw) = config.hwaccel {
-                if let Some(ref accel) = hw.hwaccel {
-                    cmd.args(["-hwaccel", accel]);
-                }
-                if let Some(ref device) = hw.device {
-                    cmd.args(["-hwaccel_device", device]);
-                }
+        if use_hw_decoding && let Some(ref hw) = config.hwaccel {
+            if let Some(ref accel) = hw.hwaccel {
+                cmd.args(["-hwaccel", accel]);
+            }
+            if let Some(ref device) = hw.device {
+                cmd.args(["-hwaccel_device", device]);
             }
         }
 

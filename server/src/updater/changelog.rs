@@ -57,10 +57,8 @@ static CHANGELOG_CACHE: OnceLock<RwLock<HashMap<&'static str, CachedChangelog>>>
 static MARKDOWN_LINK_RE: OnceLock<Regex> = OnceLock::new();
 
 pub async fn latest_changelog(channel: UpdateChannel, force: bool) -> ChangelogResponse {
-    if !force {
-        if let Some(response) = cached_response(channel).await {
-            return response;
-        }
+    if !force && let Some(response) = cached_response(channel).await {
+        return response;
     }
 
     let response = fetch_latest_changelog(channel).await;

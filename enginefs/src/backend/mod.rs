@@ -36,6 +36,7 @@ pub trait TorrentBackend: Send + Sync {
     async fn remove_torrent(&self, info_hash: &str) -> Result<()>;
     async fn list_torrents(&self) -> Vec<String>;
     async fn memory_diagnostics(&self) -> BackendMemoryDiagnostics;
+    fn set_seeding_enabled(&self, _enabled: bool) {}
 }
 
 #[async_trait::async_trait]
@@ -50,6 +51,25 @@ pub trait TorrentHandle: Send + Sync + Clone {
     /// every piece -- it is called on the hot stream-start path. Defaults to
     /// `false` (treat as still needing the swarm) for backends that cannot tell.
     async fn is_finished(&self) -> bool {
+        false
+    }
+    /// Whether this handle owns file selection, resume, and idle-pause
+    /// lifecycle internally.
+    fn manages_playback_lifecycle(&self) -> bool {
+        false
+    }
+    /// Record HLS activity without forcing shared backends to implement a
+    /// libtorrent-specific lease controller.
+    async fn refresh_hls_activity(&self, _file_idx: usize, _source: &'static str) -> Result<()> {
+        Ok(())
+    }
+    /// End HLS activity immediately. Libtorrent overrides this to cancel the
+    /// selected generation and confirm a normal torrent pause.
+    async fn end_hls_activity(&self, _file_idx: usize, _reason: &'static str) -> Result<()> {
+        Ok(())
+    }
+    /// Cheap per-file completion check used to avoid probing sparse local files.
+    async fn is_file_complete(&self, _file_idx: usize) -> bool {
         false
     }
     /// Resume torrent activity after an idle pause.
@@ -197,19 +217,11 @@ pub struct StatsFile {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub struct Growler {
     pub flood: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pulse: Option<u64>,
-}
-
-impl Default for Growler {
-    fn default() -> Self {
-        Self {
-            flood: 0,
-            pulse: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -232,20 +244,12 @@ impl Default for PeerSearch {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub struct SwarmCap {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_speed: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_peers: Option<u64>,
-}
-
-impl Default for SwarmCap {
-    fn default() -> Self {
-        Self {
-            max_speed: None,
-            min_peers: None,
-        }
-    }
 }
 
 /// Torrent speed profile settings from frontend (stremio-web)
@@ -305,16 +309,12 @@ impl Default for TorrentSpeedProfile {
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub enum TorrentEncryptionMode {
+    #[default]
     Allow,
     Require,
     Disable,
-}
-
-impl Default for TorrentEncryptionMode {
-    fn default() -> Self {
-        Self::Allow
-    }
 }
 
 impl TorrentEncryptionMode {
@@ -329,19 +329,15 @@ impl TorrentEncryptionMode {
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub enum TorrentProxyType {
+    #[default]
     None,
     Socks4,
     Socks5,
     Socks5Password,
     Http,
     HttpPassword,
-}
-
-impl Default for TorrentProxyType {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 impl TorrentProxyType {
@@ -411,7 +407,7 @@ impl Default for TorrentPrivacyConfig {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct BackendConfig {
     pub cache: priorities::EngineCacheConfig,
     pub growler: Growler,
@@ -419,19 +415,6 @@ pub struct BackendConfig {
     pub swarm_cap: SwarmCap,
     pub speed_profile: TorrentSpeedProfile,
     pub privacy: TorrentPrivacyConfig,
-}
-
-impl Default for BackendConfig {
-    fn default() -> Self {
-        Self {
-            cache: priorities::EngineCacheConfig::default(),
-            growler: Growler::default(),
-            peer_search: PeerSearch::default(),
-            swarm_cap: SwarmCap::default(),
-            speed_profile: TorrentSpeedProfile::default(),
-            privacy: TorrentPrivacyConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

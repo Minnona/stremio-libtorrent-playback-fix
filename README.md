@@ -175,11 +175,19 @@ brew install libtorrent-rasterbar boost pkg-config
 ```powershell
 # 1. Install Rust from https://rustup.rs
 # 2. Install Visual Studio Build Tools with "Desktop development with C++"
-# 3. For libtorrent, use vcpkg:
+# 3. For libtorrent, use vcpkg with the repository's v3 triplet:
 git clone https://github.com/microsoft/vcpkg
 .\vcpkg\bootstrap-vcpkg.bat
-.\vcpkg\vcpkg install libtorrent:x64-windows-static
+.\vcpkg\vcpkg install `
+  --triplet=x64-windows-v3-static-md-release `
+  --overlay-triplets="$PWD\triplets" `
+  --overlay-ports="$PWD\vcpkg-overlays"
 ```
+
+The v3 `static-md` triplet keeps libtorrent static, compiles native release
+objects with `/arch:AVX2`, and uses the dynamic MSVC runtime (`/MD`). This
+matches the repository's x86-64-v3 Rust binaries and applications using
+prebuilt Skia binaries.
 
 </details>
 

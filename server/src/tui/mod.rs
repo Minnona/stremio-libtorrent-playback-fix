@@ -149,41 +149,43 @@ fn run_tui(
             });
 
             // Adjust selection if out of bounds
-            if let Some(selected) = engine_list_state.selected() {
-                if selected >= sorted_hashes.len() {
-                    engine_list_state.select(if sorted_hashes.is_empty() {
-                        None
-                    } else {
-                        Some(sorted_hashes.len() - 1)
-                    });
-                }
+            if let Some(selected) = engine_list_state.selected()
+                && selected >= sorted_hashes.len()
+            {
+                engine_list_state.select(if sorted_hashes.is_empty() {
+                    None
+                } else {
+                    Some(sorted_hashes.len() - 1)
+                });
             }
         }
 
         // Check files
         if let Ok(new_files) = files_rx.try_recv() {
             files = new_files;
-            if let Some(selected) = file_list_state.selected() {
-                if selected >= files.len() {
-                    file_list_state.select(if files.is_empty() {
-                        None
-                    } else {
-                        Some(files.len() - 1)
-                    });
-                }
+            if let Some(selected) = file_list_state.selected()
+                && selected >= files.len()
+            {
+                file_list_state.select(if files.is_empty() {
+                    None
+                } else {
+                    Some(files.len() - 1)
+                });
             }
         }
 
         terminal.draw(|f| {
             ui(
                 f,
-                &logs,
-                &stats,
-                &sorted_hashes,
-                &files,
-                &view,
-                &mut engine_list_state,
-                &mut file_list_state,
+                UiModel {
+                    logs: &logs,
+                    stats: &stats,
+                    sorted_hashes: &sorted_hashes,
+                    files: &files,
+                    view: &view,
+                    engine_list_state: &mut engine_list_state,
+                    file_list_state: &mut file_list_state,
+                },
             )
         })?;
 
@@ -193,188 +195,172 @@ fn run_tui(
 
         if crossterm::event::poll(timeout)? {
             match event::read()? {
-                Event::Key(key) => {
-                    if key.kind == KeyEventKind::Press {
-                        match key.code {
-                            KeyCode::Char('q') | KeyCode::Esc => {
-                                break;
-                            }
-                            KeyCode::Tab => match view {
-                                View::Engines => view = View::Files,
-                                View::Files => view = View::Engines,
-                            },
-                            KeyCode::Down | KeyCode::Char('j') => match view {
-                                View::Engines => {
-                                    let i = match engine_list_state.selected() {
-                                        Some(i) => {
-                                            if i >= sorted_hashes.len().saturating_sub(1) {
-                                                i
-                                            } else {
-                                                i + 1
-                                            }
-                                        }
-                                        None => {
-                                            if sorted_hashes.is_empty() {
-                                                0
-                                            } else {
-                                                0
-                                            }
-                                        }
-                                    };
-                                    engine_list_state.select(Some(i));
-                                }
-                                View::Files => {
-                                    let i = match file_list_state.selected() {
-                                        Some(i) => {
-                                            if i >= files.len().saturating_sub(1) {
-                                                i
-                                            } else {
-                                                i + 1
-                                            }
-                                        }
-                                        None => {
-                                            if files.is_empty() {
-                                                0
-                                            } else {
-                                                0
-                                            }
-                                        }
-                                    };
-                                    file_list_state.select(Some(i));
-                                }
-                            },
-                            KeyCode::Up | KeyCode::Char('k') => match view {
-                                View::Engines => {
-                                    let i = match engine_list_state.selected() {
-                                        Some(i) => {
-                                            if i == 0 {
-                                                0
-                                            } else {
-                                                i - 1
-                                            }
-                                        }
-                                        None => 0,
-                                    };
-                                    engine_list_state.select(Some(i));
-                                }
-                                View::Files => {
-                                    let i = match file_list_state.selected() {
-                                        Some(i) => {
-                                            if i == 0 {
-                                                0
-                                            } else {
-                                                i - 1
-                                            }
-                                        }
-                                        None => 0,
-                                    };
-                                    file_list_state.select(Some(i));
-                                }
-                            },
-                            KeyCode::Char('d') | KeyCode::Delete => {
-                                match view {
-                                    View::Engines => {
-                                        if let Some(i) = engine_list_state.selected() {
-                                            if let Some(hash) = sorted_hashes.get(i) {
-                                                // Trigger removal
-                                                let hash = hash.clone();
-                                                let app = app_state.clone();
-                                                rt.spawn(async move {
-                                                    tracing::info!(
-                                                        "Users requested removal of engine: {}",
-                                                        hash
-                                                    );
-                                                    app.engine.remove_engine(&hash).await;
-                                                });
-                                            }
-                                        }
-                                    }
-                                    View::Files => {
-                                        if let Some(i) = file_list_state.selected() {
-                                            if let Some(file) = files.get(i) {
-                                                let name = file.name.clone();
-                                                let is_dir = file.is_dir;
-                                                let path =
-                                                    app_state.engine.download_dir.join(&name);
-                                                rt.spawn(async move {
-                                                    tracing::info!(
-                                                        "Users requested removal of file/dir: {:?}",
-                                                        path
-                                                    );
-                                                    if is_dir {
-                                                        let _ =
-                                                            tokio::fs::remove_dir_all(path).await;
-                                                    } else {
-                                                        let _ = tokio::fs::remove_file(path).await;
-                                                    }
-                                                });
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            _ => {}
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => {
+                            break;
                         }
+                        KeyCode::Tab => match view {
+                            View::Engines => view = View::Files,
+                            View::Files => view = View::Engines,
+                        },
+                        KeyCode::Down | KeyCode::Char('j') => match view {
+                            View::Engines => {
+                                let i = match engine_list_state.selected() {
+                                    Some(i) => {
+                                        if i >= sorted_hashes.len().saturating_sub(1) {
+                                            i
+                                        } else {
+                                            i + 1
+                                        }
+                                    }
+                                    None => 0,
+                                };
+                                engine_list_state.select(Some(i));
+                            }
+                            View::Files => {
+                                let i = match file_list_state.selected() {
+                                    Some(i) => {
+                                        if i >= files.len().saturating_sub(1) {
+                                            i
+                                        } else {
+                                            i + 1
+                                        }
+                                    }
+                                    None => 0,
+                                };
+                                file_list_state.select(Some(i));
+                            }
+                        },
+                        KeyCode::Up | KeyCode::Char('k') => match view {
+                            View::Engines => {
+                                let i = match engine_list_state.selected() {
+                                    Some(i) => {
+                                        if i == 0 {
+                                            0
+                                        } else {
+                                            i - 1
+                                        }
+                                    }
+                                    None => 0,
+                                };
+                                engine_list_state.select(Some(i));
+                            }
+                            View::Files => {
+                                let i = match file_list_state.selected() {
+                                    Some(i) => {
+                                        if i == 0 {
+                                            0
+                                        } else {
+                                            i - 1
+                                        }
+                                    }
+                                    None => 0,
+                                };
+                                file_list_state.select(Some(i));
+                            }
+                        },
+                        KeyCode::Char('d') | KeyCode::Delete => {
+                            match view {
+                                View::Engines => {
+                                    if let Some(i) = engine_list_state.selected()
+                                        && let Some(hash) = sorted_hashes.get(i)
+                                    {
+                                        // Trigger removal
+                                        let hash = hash.clone();
+                                        let app = app_state.clone();
+                                        rt.spawn(async move {
+                                            tracing::info!(
+                                                "Users requested removal of engine: {}",
+                                                hash
+                                            );
+                                            app.engine.remove_engine(&hash).await;
+                                        });
+                                    }
+                                }
+                                View::Files => {
+                                    if let Some(i) = file_list_state.selected()
+                                        && let Some(file) = files.get(i)
+                                    {
+                                        let name = file.name.clone();
+                                        let is_dir = file.is_dir;
+                                        let path = app_state.engine.download_dir.join(&name);
+                                        rt.spawn(async move {
+                                            tracing::info!(
+                                                "Users requested removal of file/dir: {:?}",
+                                                path
+                                            );
+                                            if is_dir {
+                                                let _ = tokio::fs::remove_dir_all(path).await;
+                                            } else {
+                                                let _ = tokio::fs::remove_file(path).await;
+                                            }
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
-                Event::Mouse(mouse) => {
-                    if mouse.kind == MouseEventKind::Down(crossterm::event::MouseButton::Left) {
-                        // Layout must match UI exactly for hit testing
-                        let size = terminal.size()?;
-                        let area = Rect::new(0, 0, size.width, size.height);
-                        let chunks = Layout::default()
-                            .direction(Direction::Vertical)
-                            .constraints([
-                                Constraint::Length(3),      // Header
-                                Constraint::Length(3),      // Tabs
-                                Constraint::Percentage(50), // Content
-                                Constraint::Percentage(50), // Logs
-                            ])
-                            .split(area);
+                Event::Mouse(mouse)
+                    if mouse.kind == MouseEventKind::Down(crossterm::event::MouseButton::Left) =>
+                {
+                    // Layout must match UI exactly for hit testing
+                    let size = terminal.size()?;
+                    let area = Rect::new(0, 0, size.width, size.height);
+                    let chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Length(3),      // Header
+                            Constraint::Length(3),      // Tabs
+                            Constraint::Percentage(50), // Content
+                            Constraint::Percentage(50), // Logs
+                        ])
+                        .split(area);
 
-                        let tabs_area = chunks[1];
-                        let list_area = chunks[2];
+                    let tabs_area = chunks[1];
+                    let list_area = chunks[2];
 
-                        // Hit test Tabs
-                        if mouse.column >= tabs_area.x
-                            && mouse.column < tabs_area.x + tabs_area.width
-                            && mouse.row >= tabs_area.y
-                            && mouse.row < tabs_area.y + tabs_area.height
-                        {
-                            // Simple heuristic for 2 tabs left-aligned
-                            // "Active Engines [Tab]" ~ 20 chars
-                            // "Downloaded Files [Tab]" ~ 22 chars
-                            let rel_x = mouse.column.saturating_sub(tabs_area.x);
-                            if rel_x < 22 {
-                                view = View::Engines;
-                            } else if rel_x < 50 {
-                                view = View::Files;
-                            }
+                    // Hit test Tabs
+                    if mouse.column >= tabs_area.x
+                        && mouse.column < tabs_area.x + tabs_area.width
+                        && mouse.row >= tabs_area.y
+                        && mouse.row < tabs_area.y + tabs_area.height
+                    {
+                        // Simple heuristic for 2 tabs left-aligned
+                        // "Active Engines [Tab]" ~ 20 chars
+                        // "Downloaded Files [Tab]" ~ 22 chars
+                        let rel_x = mouse.column.saturating_sub(tabs_area.x);
+                        if rel_x < 22 {
+                            view = View::Engines;
+                        } else if rel_x < 50 {
+                            view = View::Files;
                         }
+                    }
 
-                        // Hit test List
-                        if mouse.column >= list_area.x
-                            && mouse.column < list_area.x + list_area.width
-                            && mouse.row >= list_area.y
-                            && mouse.row < list_area.y + list_area.height
-                        {
-                            // List has borders (1px)
-                            let inner_y = mouse.row as i32 - list_area.y as i32 - 1; // -1 for top border
-                            if inner_y >= 0 {
-                                match view {
-                                    View::Engines => {
-                                        let offset = engine_list_state.offset();
-                                        let index = offset + inner_y as usize;
-                                        if index < sorted_hashes.len() {
-                                            engine_list_state.select(Some(index));
-                                        }
+                    // Hit test List
+                    if mouse.column >= list_area.x
+                        && mouse.column < list_area.x + list_area.width
+                        && mouse.row >= list_area.y
+                        && mouse.row < list_area.y + list_area.height
+                    {
+                        // List has borders (1px)
+                        let inner_y = mouse.row as i32 - list_area.y as i32 - 1; // -1 for top border
+                        if inner_y >= 0 {
+                            match view {
+                                View::Engines => {
+                                    let offset = engine_list_state.offset();
+                                    let index = offset + inner_y as usize;
+                                    if index < sorted_hashes.len() {
+                                        engine_list_state.select(Some(index));
                                     }
-                                    View::Files => {
-                                        let offset = file_list_state.offset();
-                                        let index = offset + inner_y as usize;
-                                        if index < files.len() {
-                                            file_list_state.select(Some(index));
-                                        }
+                                }
+                                View::Files => {
+                                    let offset = file_list_state.offset();
+                                    let index = offset + inner_y as usize;
+                                    if index < files.len() {
+                                        file_list_state.select(Some(index));
                                     }
                                 }
                             }
@@ -413,16 +399,26 @@ fn run_tui(
     Ok(())
 }
 
-fn ui(
-    f: &mut ratatui::Frame,
-    logs: &VecDeque<String>,
-    stats: &HashMap<String, EngineStats>,
-    sorted_hashes: &Vec<String>,
-    files: &Vec<FileInfo>,
-    view: &View,
-    engine_list_state: &mut ListState,
-    file_list_state: &mut ListState,
-) {
+struct UiModel<'a> {
+    logs: &'a VecDeque<String>,
+    stats: &'a HashMap<String, EngineStats>,
+    sorted_hashes: &'a [String],
+    files: &'a [FileInfo],
+    view: &'a View,
+    engine_list_state: &'a mut ListState,
+    file_list_state: &'a mut ListState,
+}
+
+fn ui(f: &mut ratatui::Frame, model: UiModel<'_>) {
+    let UiModel {
+        logs,
+        stats,
+        sorted_hashes,
+        files,
+        view,
+        engine_list_state,
+        file_list_state,
+    } = model;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([

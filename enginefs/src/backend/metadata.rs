@@ -248,8 +248,8 @@ impl MetadataInspector {
         }
 
         let mut value = (first as u64) & ((1 << (8 - len)) - 1);
-        for i in 1..len {
-            value = (value << 8) | (data[i] as u64);
+        for &byte in data.iter().take(len).skip(1) {
+            value = (value << 8) | u64::from(byte);
         }
 
         Some((value, len))
@@ -260,19 +260,20 @@ impl MetadataInspector {
 
         while pos + 2 < data.len() {
             // Look for Seek element (0x4DBB)
-            if data[pos] == 0x4D && data[pos + 1] == 0xBB {
-                if let Some((size, header_size)) = Self::parse_ebml_element_header(&data[pos..]) {
-                    let seek_data = &data[pos + header_size..];
-                    let seek_size = (size as usize).min(seek_data.len());
+            if data[pos] == 0x4D
+                && data[pos + 1] == 0xBB
+                && let Some((size, header_size)) = Self::parse_ebml_element_header(&data[pos..])
+            {
+                let seek_data = &data[pos + header_size..];
+                let seek_size = (size as usize).min(seek_data.len());
 
-                    // Parse Seek element to find Cues reference
-                    if let Some(cues_pos) = Self::parse_seek_element(&seek_data[..seek_size]) {
-                        return Some(cues_pos);
-                    }
-
-                    pos += header_size + size as usize;
-                    continue;
+                // Parse Seek element to find Cues reference
+                if let Some(cues_pos) = Self::parse_seek_element(&seek_data[..seek_size]) {
+                    return Some(cues_pos);
                 }
+
+                pos += header_size + size as usize;
+                continue;
             }
             pos += 1;
         }
@@ -287,46 +288,48 @@ impl MetadataInspector {
 
         while pos + 2 < data.len() {
             // SeekID (0x53AB)
-            if data[pos] == 0x53 && data[pos + 1] == 0xAB {
-                if let Some((size, header_size)) = Self::parse_ebml_element_header(&data[pos..]) {
-                    let id_data = &data[pos + header_size..];
-                    if size as usize <= id_data.len() {
-                        // Parse the ID bytes
-                        let mut id = 0u32;
-                        for i in 0..size as usize {
-                            id = (id << 8) | (id_data[i] as u32);
-                        }
-                        seek_id = Some(id);
+            if data[pos] == 0x53
+                && data[pos + 1] == 0xAB
+                && let Some((size, header_size)) = Self::parse_ebml_element_header(&data[pos..])
+            {
+                let id_data = &data[pos + header_size..];
+                if size as usize <= id_data.len() {
+                    // Parse the ID bytes
+                    let mut id = 0u32;
+                    for &byte in id_data.iter().take(size as usize) {
+                        id = (id << 8) | u32::from(byte);
                     }
-                    pos += header_size + size as usize;
-                    continue;
+                    seek_id = Some(id);
                 }
+                pos += header_size + size as usize;
+                continue;
             }
 
             // SeekPosition (0x53AC)
-            if data[pos] == 0x53 && data[pos + 1] == 0xAC {
-                if let Some((size, header_size)) = Self::parse_ebml_element_header(&data[pos..]) {
-                    let pos_data = &data[pos + header_size..];
-                    if size as usize <= pos_data.len() {
-                        let mut position = 0u64;
-                        for i in 0..size as usize {
-                            position = (position << 8) | (pos_data[i] as u64);
-                        }
-                        seek_position = Some(position);
+            if data[pos] == 0x53
+                && data[pos + 1] == 0xAC
+                && let Some((size, header_size)) = Self::parse_ebml_element_header(&data[pos..])
+            {
+                let pos_data = &data[pos + header_size..];
+                if size as usize <= pos_data.len() {
+                    let mut position = 0u64;
+                    for &byte in pos_data.iter().take(size as usize) {
+                        position = (position << 8) | u64::from(byte);
                     }
-                    pos += header_size + size as usize;
-                    continue;
+                    seek_position = Some(position);
                 }
+                pos += header_size + size as usize;
+                continue;
             }
 
             pos += 1;
         }
 
         // Check if this Seek element points to Cues (0x1C53BB6B)
-        if let (Some(id), Some(position)) = (seek_id, seek_position) {
-            if id == ebml_ids::CUES {
-                return Some(position);
-            }
+        if let (Some(id), Some(position)) = (seek_id, seek_position)
+            && id == ebml_ids::CUES
+        {
+            return Some(position);
         }
 
         None
@@ -372,27 +375,26 @@ impl MetadataInspector {
             && data[pos + 1] == 0x53
             && data[pos + 2] == 0xBB
             && data[pos + 3] == 0x6B
+            && let Some((_, header_size)) = Self::parse_ebml_element_header(&data[pos..])
         {
-            if let Some((_, header_size)) = Self::parse_ebml_element_header(&data[pos..]) {
-                pos += header_size;
-            }
+            pos += header_size;
         }
 
         // Look for CuePoint elements (0xBB)
         while pos + 1 < data.len() && positions.len() < 50 {
-            if data[pos] == 0xBB {
-                if let Some((size, header_size)) = Self::parse_ebml_element_header(&data[pos..]) {
-                    let cue_data = &data[pos + header_size..];
-                    let cue_size = (size as usize).min(cue_data.len());
+            if data[pos] == 0xBB
+                && let Some((size, header_size)) = Self::parse_ebml_element_header(&data[pos..])
+            {
+                let cue_data = &data[pos + header_size..];
+                let cue_size = (size as usize).min(cue_data.len());
 
-                    // Parse CuePoint to find CueClusterPosition
-                    if let Some(cluster_pos) = Self::parse_cue_point(&cue_data[..cue_size]) {
-                        positions.push(cluster_pos);
-                    }
-
-                    pos += header_size + size as usize;
-                    continue;
+                // Parse CuePoint to find CueClusterPosition
+                if let Some(cluster_pos) = Self::parse_cue_point(&cue_data[..cue_size]) {
+                    positions.push(cluster_pos);
                 }
+
+                pos += header_size + size as usize;
+                continue;
             }
             pos += 1;
         }
@@ -405,34 +407,33 @@ impl MetadataInspector {
 
         while pos + 1 < data.len() {
             // CueTrackPositions (0xB7)
-            if data[pos] == 0xB7 {
-                if let Some((size, header_size)) = Self::parse_ebml_element_header(&data[pos..]) {
-                    let track_data = &data[pos + header_size..];
-                    let track_size = (size as usize).min(track_data.len());
+            if data[pos] == 0xB7
+                && let Some((size, header_size)) = Self::parse_ebml_element_header(&data[pos..])
+            {
+                let track_data = &data[pos + header_size..];
+                let track_size = (size as usize).min(track_data.len());
 
-                    // Look for CueClusterPosition (0xF1)
-                    let mut tpos = 0;
-                    while tpos + 1 < track_size {
-                        if track_data[tpos] == 0xF1 {
-                            if let Some((psize, pheader)) =
-                                Self::parse_ebml_element_header(&track_data[tpos..])
-                            {
-                                let pdata = &track_data[tpos + pheader..];
-                                if psize as usize <= pdata.len() {
-                                    let mut cluster_pos = 0u64;
-                                    for i in 0..psize as usize {
-                                        cluster_pos = (cluster_pos << 8) | (pdata[i] as u64);
-                                    }
-                                    return Some(cluster_pos);
-                                }
+                // Look for CueClusterPosition (0xF1)
+                let mut tpos = 0;
+                while tpos + 1 < track_size {
+                    if track_data[tpos] == 0xF1
+                        && let Some((psize, pheader)) =
+                            Self::parse_ebml_element_header(&track_data[tpos..])
+                    {
+                        let pdata = &track_data[tpos + pheader..];
+                        if psize as usize <= pdata.len() {
+                            let mut cluster_pos = 0u64;
+                            for &byte in pdata.iter().take(psize as usize) {
+                                cluster_pos = (cluster_pos << 8) | u64::from(byte);
                             }
+                            return Some(cluster_pos);
                         }
-                        tpos += 1;
                     }
-
-                    pos += header_size + size as usize;
-                    continue;
+                    tpos += 1;
                 }
+
+                pos += header_size + size as usize;
+                continue;
             }
             pos += 1;
         }
@@ -495,12 +496,12 @@ impl MetadataInspector {
             if box_type == *b"mdat" && actual_size > 10_000_000 {
                 // Large mdat before moov - check end of file
                 debug!("MetadataInspector: Large 'mdat', checking end for 'moov'");
-                if let Ok(end_ranges) = Self::check_mp4_end(reader, total_size).await {
-                    if !end_ranges.is_empty() {
-                        ranges.extend(end_ranges);
-                        moov_found = true;
-                        break;
-                    }
+                if let Ok(end_ranges) = Self::check_mp4_end(reader, total_size).await
+                    && !end_ranges.is_empty()
+                {
+                    ranges.extend(end_ranges);
+                    moov_found = true;
+                    break;
                 }
             }
 

@@ -45,11 +45,11 @@ impl NzbSession {
                 for _ in 0..server.connections {
                     match NntpClient::connect(&server.host, server.port, server.ssl).await {
                         Ok(mut client) => {
-                            if let (Some(u), Some(p)) = (&server.user, &server.pass) {
-                                if let Err(e) = client.authenticate(u, p).await {
-                                    tracing::error!("NNTP Auth failed for {}: {}", server.host, e);
-                                    continue;
-                                }
+                            if let (Some(u), Some(p)) = (&server.user, &server.pass)
+                                && let Err(e) = client.authenticate(u, p).await
+                            {
+                                tracing::error!("NNTP Auth failed for {}: {}", server.host, e);
+                                continue;
                             }
                             let _ = tx_clone.send(client).await;
                         }

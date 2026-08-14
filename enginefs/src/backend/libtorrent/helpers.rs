@@ -68,8 +68,7 @@ pub(super) async fn read_piece_from_disk(
         // If it's just the last piece of the torrent, it might be fine, but for simplicity
         // and safety, we skip caching any non-full-length chunk.
         // This means we won't prefetch edge pieces, which is acceptable collateral damage.
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(std::io::Error::other(
             "Skipping partial piece caching to preserve consistency",
         ));
     }

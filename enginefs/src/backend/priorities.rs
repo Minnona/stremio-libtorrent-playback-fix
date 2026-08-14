@@ -1,8 +1,10 @@
 use serde::{Deserialize, Serialize};
 
-/// Minimum bytes needed before playback can start.
-pub const MIN_STARTUP_BYTES: u64 = 16 * 1024 * 1024; // 16MB
-pub const MAX_STARTUP_WINDOW_BYTES: u64 = 32 * 1024 * 1024;
+/// Startup is gated on the actual first readable bytes. Keep speculative work
+/// near MPV's 4 MiB network buffer so rare seek/Cues pieces are not starved by
+/// a large urgent head window.
+pub const MIN_STARTUP_BYTES: u64 = 4 * 1024 * 1024;
+pub const MAX_STARTUP_WINDOW_BYTES: u64 = 4 * 1024 * 1024;
 pub const MAX_SEEK_HOT_WINDOW_BYTES: u64 = 128 * 1024 * 1024;
 pub const MAX_WARM_WINDOW_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_CONTAINER_METADATA_WINDOW_BYTES: u64 = 16 * 1024 * 1024;
@@ -22,7 +24,7 @@ pub const MIN_SEEK_HOT_PIECES: i32 = 24;
 pub const SEEK_IMMEDIATE_PIECES: i32 = 12;
 pub const MAX_HOT_PIECES: i32 = 96;
 pub const MAX_WARM_PIECES: i32 = 192;
-pub const BLOCKED_REPLAN_INTERVAL_MS: u64 = 250;
+pub const BLOCKED_REPLAN_INTERVAL_MS: u64 = 8_000;
 
 /// Start treating reads as "container metadata" when they fall in the last 10MB
 /// or the last 5% of the file, whichever starts earlier.
@@ -344,7 +346,7 @@ impl PlaybackPriorityPolicy {
 
         let original_hot = hot;
         let original_warm = warm;
-        hot = cap_pieces_by_bytes(hot, ctx.piece_length, hot_byte_cap(ctx.intent));
+        hot = cap_pieces_by_bytes(hot, ctx.piece_length, hot_byte_cap(&ctx));
         warm = cap_pieces_by_bytes(warm, ctx.piece_length, warm_byte_cap(ctx.intent));
         if hot < original_hot || warm < original_warm {
             reason.push_str("-byte-cap");
@@ -408,9 +410,12 @@ fn cap_pieces_by_bytes(pieces: i32, piece_length: u64, max_bytes: u64) -> i32 {
     pieces.min(pieces_for_bytes(max_bytes, piece_length).max(1))
 }
 
-fn hot_byte_cap(intent: PlaybackIntent) -> u64 {
-    match intent {
-        PlaybackIntent::DirectInitial | PlaybackIntent::HlsInitial => MAX_STARTUP_WINDOW_BYTES,
+fn hot_byte_cap(ctx: &PriorityContext) -> u64 {
+    match ctx.intent {
+        PlaybackIntent::DirectInitial | PlaybackIntent::HlsInitial if !ctx.first_byte_sent => {
+            MAX_STARTUP_WINDOW_BYTES
+        }
+        PlaybackIntent::DirectInitial | PlaybackIntent::HlsInitial => MAX_SEEK_HOT_WINDOW_BYTES,
         PlaybackIntent::DirectSeek
         | PlaybackIntent::HlsSeek
         | PlaybackIntent::DirectSequential
@@ -784,16 +789,18 @@ mod tests {
     }
 
     #[test]
-    fn small_file_startup_can_prioritize_more_than_default_four_pieces() {
+    fn small_file_startup_respects_mpv_buffer_cap() {
         let mut ctx = base_context(PlaybackIntent::DirectInitial);
         ctx.current_piece = 0;
         ctx.first_byte_sent = false;
         ctx.file_size = 8 * 1024 * 1024;
         ctx.last_piece = 7;
         ctx.piece_length = 1024 * 1024;
+        let piece_length = ctx.piece_length;
         let decision = PlaybackPriorityPolicy::decide(ctx);
 
-        assert_eq!(decision.hot_window_pieces, 8);
+        assert_eq!(decision.hot_window_pieces, 4);
+        assert!(decision.hot_window_pieces as u64 * piece_length <= MAX_STARTUP_WINDOW_BYTES);
         assert_eq!(decision.warm_window_pieces, 0);
         // Immediate band stays focused on the head so the first pieces get
         // all the bandwidth instead of the whole file downloading in parallel.

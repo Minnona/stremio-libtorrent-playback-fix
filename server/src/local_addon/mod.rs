@@ -124,10 +124,11 @@ async fn handle_meta(
 
     // Handle local: prefix - use local index
     let items_map = state.local_index.items.read().unwrap();
-    if let Some(items) = items_map.get(&id) {
-        if let Some(first) = items.first() {
-            // For series, we might want to list videos
-            let videos: Vec<Value> = items.iter().map(|it| {
+    if let Some(items) = items_map.get(&id)
+        && let Some(first) = items.first()
+    {
+        // For series, we might want to list videos
+        let videos: Vec<Value> = items.iter().map(|it| {
                  json!({
                      "id": format!("{}:{}:{}", id, it.metadata.season.unwrap_or(1), it.metadata.episode.as_ref().map(|v| v[0]).unwrap_or(1)),
                      "title": it.metadata.name.clone(),
@@ -137,14 +138,13 @@ async fn handle_meta(
                  })
              }).collect();
 
-            let meta = json!({
-                "id": id,
-                "type": type_,
-                "name": first.metadata.name,
-                "videos": videos,
-            });
-            return Json(json!({ "meta": meta }));
-        }
+        let meta = json!({
+            "id": id,
+            "type": type_,
+            "name": first.metadata.name,
+            "videos": videos,
+        });
+        return Json(json!({ "meta": meta }));
     }
     Json(json!({ "meta": null }))
 }

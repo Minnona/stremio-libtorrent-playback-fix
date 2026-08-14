@@ -16,7 +16,7 @@ impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> Connection for T {
 
 enum StreamType {
     Plain(TcpStream),
-    Tls(TlsStream<TcpStream>),
+    Tls(Box<TlsStream<TcpStream>>),
 }
 
 // To use BufReader we need strictly AsyncRead + AsyncWrite on the enum or box.
@@ -37,7 +37,7 @@ impl tokio::io::AsyncRead for NntpStream {
     ) -> Poll<std::io::Result<()>> {
         match &mut self.inner {
             StreamType::Plain(s) => Pin::new(s).poll_read(cx, buf),
-            StreamType::Tls(s) => Pin::new(s).poll_read(cx, buf),
+            StreamType::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
         }
     }
 }
@@ -50,21 +50,21 @@ impl tokio::io::AsyncWrite for NntpStream {
     ) -> Poll<std::io::Result<usize>> {
         match &mut self.inner {
             StreamType::Plain(s) => Pin::new(s).poll_write(cx, buf),
-            StreamType::Tls(s) => Pin::new(s).poll_write(cx, buf),
+            StreamType::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
         }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match &mut self.inner {
             StreamType::Plain(s) => Pin::new(s).poll_flush(cx),
-            StreamType::Tls(s) => Pin::new(s).poll_flush(cx),
+            StreamType::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
         }
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match &mut self.inner {
             StreamType::Plain(s) => Pin::new(s).poll_shutdown(cx),
-            StreamType::Tls(s) => Pin::new(s).poll_shutdown(cx),
+            StreamType::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
         }
     }
 }
@@ -87,7 +87,7 @@ impl Client {
             // Using host as domain.
             let tls_stream = connector.connect(host, tcp).await?;
             NntpStream {
-                inner: StreamType::Tls(tls_stream),
+                inner: StreamType::Tls(Box::new(tls_stream)),
             }
         } else {
             NntpStream {
@@ -167,7 +167,7 @@ impl Client {
 
             // Dot-unstuffing: If line starts with .., remove first dot
             if line.starts_with("..") {
-                body.extend_from_slice(line[1..].as_bytes());
+                body.extend_from_slice(&line.as_bytes()[1..]);
             } else {
                 body.extend_from_slice(line.as_bytes());
             }

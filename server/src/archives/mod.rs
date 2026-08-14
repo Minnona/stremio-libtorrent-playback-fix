@@ -41,9 +41,7 @@ pub struct CacheConfig {
 impl CacheConfig {
     /// Get the cache directory, falling back to system temp if not configured
     pub fn get_dir_or_temp(&self) -> std::path::PathBuf {
-        self.cache_dir
-            .clone()
-            .unwrap_or_else(|| std::env::temp_dir())
+        self.cache_dir.clone().unwrap_or_else(std::env::temp_dir)
     }
 }
 
@@ -61,12 +59,11 @@ pub fn is_archive(path: &Path) -> bool {
     if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
         let ext = ext.to_lowercase();
         // Check compound extension for .tar.gz
-        if ext == "gz" {
-            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                if stem.to_lowercase().ends_with(".tar") {
-                    return true;
-                }
-            }
+        if ext == "gz"
+            && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+            && stem.to_lowercase().ends_with(".tar")
+        {
+            return true;
         }
         return matches!(ext.as_str(), "zip" | "rar" | "7z" | "tar" | "tgz" | "nzb");
     }

@@ -19,6 +19,17 @@ pub struct DiskCacheManager {
     max_cache_bytes: u64,
 }
 
+pub struct DiskCacheFile<'a> {
+    pub info_hash: &'a str,
+    pub file_name: &'a str,
+    pub file_size: u64,
+    pub file_offset: u64,
+    pub piece_length: u64,
+    pub first_piece: i32,
+    pub last_piece: i32,
+    pub piece_cache: &'a PieceCacheManager,
+}
+
 impl DiskCacheManager {
     pub fn new(cache_dir: PathBuf, max_cache_bytes: u64) -> Self {
         let _ = std::fs::create_dir_all(&cache_dir);
@@ -41,17 +52,17 @@ impl DiskCacheManager {
     /// Attempt to persist a completed file from the in-memory piece cache to disk.
     ///
     /// Returns `Some(path)` if successfully cached, `None` if skipped (too large or incomplete).
-    pub async fn maybe_persist_file(
-        &self,
-        info_hash: &str,
-        file_name: &str,
-        file_size: u64,
-        file_offset: u64,
-        piece_length: u64,
-        first_piece: i32,
-        last_piece: i32,
-        piece_cache: &PieceCacheManager,
-    ) -> Option<PathBuf> {
+    pub async fn maybe_persist_file(&self, file: DiskCacheFile<'_>) -> Option<PathBuf> {
+        let DiskCacheFile {
+            info_hash,
+            file_name,
+            file_size,
+            file_offset,
+            piece_length,
+            first_piece,
+            last_piece,
+            piece_cache,
+        } = file;
         // Skip if cache is disabled (max_cache_bytes == 0)
         if self.max_cache_bytes == 0 {
             debug!("DiskCache: Skipping persist (cache disabled)");
@@ -154,10 +165,10 @@ impl DiskCacheManager {
                         // Walk subdirectory
                         if let Ok(mut sub_entries) = tokio::fs::read_dir(entry.path()).await {
                             while let Ok(Some(sub_entry)) = sub_entries.next_entry().await {
-                                if let Ok(sub_meta) = sub_entry.metadata().await {
-                                    if sub_meta.is_file() {
-                                        total += sub_meta.len();
-                                    }
+                                if let Ok(sub_meta) = sub_entry.metadata().await
+                                    && sub_meta.is_file()
+                                {
+                                    total += sub_meta.len();
                                 }
                             }
                         }

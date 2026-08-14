@@ -55,13 +55,10 @@ impl UpdateManager {
 
         {
             let inner = self.inner.read().await;
-            if !force {
-                if let Some(last_checked) = inner.status.last_checked_unix_secs {
-                    let interval_secs = settings.update_check_interval_hours.saturating_mul(3600);
-                    if interval_secs > 0 && now.saturating_sub(last_checked) < interval_secs as i64
-                    {
-                        return Ok(inner.status.clone());
-                    }
+            if !force && let Some(last_checked) = inner.status.last_checked_unix_secs {
+                let interval_secs = settings.update_check_interval_hours.saturating_mul(3600);
+                if interval_secs > 0 && now.saturating_sub(last_checked) < interval_secs as i64 {
+                    return Ok(inner.status.clone());
                 }
             }
         }
@@ -226,10 +223,10 @@ impl UpdateManager {
             tokio::time::sleep(Duration::from_secs(30)).await;
             loop {
                 let settings = app_state.settings.read().await.clone();
-                if settings.auto_update_enabled {
-                    if let Err(err) = self.check_for_updates(&settings, false).await {
-                        tracing::warn!(error = %err, "background update check failed");
-                    }
+                if settings.auto_update_enabled
+                    && let Err(err) = self.check_for_updates(&settings, false).await
+                {
+                    tracing::warn!(error = %err, "background update check failed");
                 }
 
                 let interval = settings.update_check_interval_hours.max(1);

@@ -360,7 +360,7 @@ fn sha256_file(path: &Path) -> Result<String> {
 fn appdata_dir() -> PathBuf {
     env::var_os("APPDATA")
         .map(PathBuf::from)
-        .unwrap_or_else(|| data_local_dir())
+        .unwrap_or_else(data_local_dir)
 }
 
 fn data_local_dir() -> PathBuf {

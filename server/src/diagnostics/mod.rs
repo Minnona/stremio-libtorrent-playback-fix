@@ -21,6 +21,15 @@ use sysinfo::{Pid, System};
 
 use crate::state::AppState;
 
+#[derive(Debug, Clone, Copy)]
+struct LocalOnly;
+
+impl IntoResponse for LocalOnly {
+    fn into_response(self) -> Response {
+        (StatusCode::FORBIDDEN, "Diagnostics are local-only").into_response()
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ProcessMemorySnapshot {
     pub pid: u32,
@@ -270,7 +279,7 @@ pub async fn memory(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Response {
     if let Err(response) = ensure_local(addr) {
-        return response;
+        return response.into_response();
     }
 
     Json(memory_snapshot_for_state(&state).await).into_response()
@@ -281,7 +290,7 @@ pub async fn streams(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Response {
     if let Err(response) = ensure_local(addr) {
-        return response;
+        return response.into_response();
     }
 
     Json(state.stream_engine().stream_activity_snapshot().await).into_response()
@@ -292,7 +301,7 @@ pub async fn crashes(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Response {
     if let Err(response) = ensure_local(addr) {
-        return response;
+        return response.into_response();
     }
 
     Json(list_crashes(&state)).into_response()
@@ -303,7 +312,7 @@ pub async fn logs(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Response {
     if let Err(response) = ensure_local(addr) {
-        return response;
+        return response.into_response();
     }
 
     Json(logs_snapshot(&state)).into_response()
@@ -315,7 +324,7 @@ pub async fn current_log(
     Query(query): Query<CurrentLogQuery>,
 ) -> Response {
     if let Err(response) = ensure_local(addr) {
-        return response;
+        return response.into_response();
     }
 
     let lines = query.lines.unwrap_or(500).clamp(1, 5000);
@@ -363,7 +372,7 @@ pub async fn export(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Response {
     if let Err(response) = ensure_local(addr) {
-        return response;
+        return response.into_response();
     }
 
     match build_diagnostics_zip(&state) {
@@ -386,11 +395,11 @@ pub async fn export(
     }
 }
 
-fn ensure_local(addr: SocketAddr) -> Result<(), Response> {
+fn ensure_local(addr: SocketAddr) -> Result<(), LocalOnly> {
     if addr.ip().is_loopback() {
         Ok(())
     } else {
-        Err((StatusCode::FORBIDDEN, "Diagnostics are local-only").into_response())
+        Err(LocalOnly)
     }
 }
 
@@ -435,7 +444,7 @@ fn recent_log_files(log_dir: &Path, limit: usize) -> Vec<LogFileInfo> {
         })
         .collect::<Vec<_>>();
 
-    logs.sort_by(|a, b| b.modified_unix_secs.cmp(&a.modified_unix_secs));
+    logs.sort_by_key(|log| std::cmp::Reverse(log.modified_unix_secs));
     logs.truncate(limit);
     logs
 }

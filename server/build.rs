@@ -2,11 +2,10 @@ fn main() {
     if let Ok(output) = std::process::Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .output()
+        && output.status.success()
     {
-        if output.status.success() {
-            let sha = String::from_utf8_lossy(&output.stdout);
-            println!("cargo:rustc-env=GIT_SHA={}", sha.trim());
-        }
+        let sha = String::from_utf8_lossy(&output.stdout);
+        println!("cargo:rustc-env=GIT_SHA={}", sha.trim());
     }
 
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();

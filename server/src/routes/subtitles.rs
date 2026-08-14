@@ -40,23 +40,21 @@ pub async fn opensub_hash(
         }
     }
 
-    if let (Some(info_hash), Some(file_idx)) = (info_hash, file_idx) {
-        if let Some(engine) = state.stream_engine().get_engine(&info_hash).await {
-            match engine.get_opensub_hash(file_idx).await {
-                Ok(hash) => {
-                    let size = engine
-                        .handle
-                        .get_files()
-                        .await
-                        .get(file_idx)
-                        .map(|file| file.length)
-                        .unwrap_or(0);
-                    return Json(
-                        json!({ "error": null, "result": { "hash": hash, "size": size } }),
-                    );
-                }
-                Err(e) => return Json(json!({ "error": e.to_string(), "result": null })),
+    if let (Some(info_hash), Some(file_idx)) = (info_hash, file_idx)
+        && let Some(engine) = state.stream_engine().get_engine(&info_hash).await
+    {
+        match engine.get_opensub_hash(file_idx).await {
+            Ok(hash) => {
+                let size = engine
+                    .handle
+                    .get_files()
+                    .await
+                    .get(file_idx)
+                    .map(|file| file.length)
+                    .unwrap_or(0);
+                return Json(json!({ "error": null, "result": { "hash": hash, "size": size } }));
             }
+            Err(e) => return Json(json!({ "error": e.to_string(), "result": null })),
         }
     }
 
@@ -106,24 +104,24 @@ pub async fn subtitles_tracks(
         }
     }
 
-    if let Some(info_hash) = info_hash {
-        if let Some(engine) = state.stream_engine().get_engine(&info_hash).await {
-            let tracks: Vec<SubtitleTrack> = engine.find_subtitle_tracks().await;
+    if let Some(info_hash) = info_hash
+        && let Some(engine) = state.stream_engine().get_engine(&info_hash).await
+    {
+        let tracks: Vec<SubtitleTrack> = engine.find_subtitle_tracks().await;
 
-            let result: Vec<serde_json::Value> = tracks
-                .into_iter()
-                .map(|t| {
-                    json!({
-                        "id": t.id,
-                        "lang": "Unknown",
-                        "label": t.name,
-                        "url": format!("/{}/{}/subtitles.vtt", info_hash, t.id)
-                    })
+        let result: Vec<serde_json::Value> = tracks
+            .into_iter()
+            .map(|t| {
+                json!({
+                    "id": t.id,
+                    "lang": "Unknown",
+                    "label": t.name,
+                    "url": format!("/{}/{}/subtitles.vtt", info_hash, t.id)
                 })
-                .collect();
+            })
+            .collect();
 
-            return Json(json!({ "error": null, "result": result }));
-        }
+        return Json(json!({ "error": null, "result": result }));
     }
 
     Json(json!({ "error": null, "result": [] }))

@@ -95,6 +95,10 @@ pub async fn probe_by_url(
         Err(err) => return (StatusCode::NOT_FOUND, err).into_response(),
     };
 
+    state
+        .stream_engine()
+        .refresh_hls_playback(&info_hash, file_idx, "hls-probe-url")
+        .await;
     let probe = match engine.get_probe_result(file_idx, &media_url).await {
         Ok(p) => p,
         Err(e) => {
@@ -107,7 +111,12 @@ pub async fn probe_by_url(
     };
 
     let elapsed = start.elapsed();
-    tracing::info!("Probe request for {} took {:?}", media_url, elapsed);
+    tracing::info!(
+        info_hash = %info_hash,
+        file_idx,
+        elapsed_ms = elapsed.as_millis() as u64,
+        "HLS probe request completed"
+    );
 
     Json(stremio_probe_json(&info_hash, file_idx, &probe)).into_response()
 }
@@ -156,7 +165,9 @@ pub async fn master_playlist_by_url(
         .stream_engine()
         .refresh_hls_playback(&info_hash, file_idx, "hls-master-url")
         .await;
-    state.stream_engine().focus_torrent(&info_hash).await;
+    if !engine.handle.manages_playback_lifecycle() {
+        state.stream_engine().focus_torrent(&info_hash).await;
+    }
 
     let probe = match engine.get_probe_result(file_idx, &media_url).await {
         Ok(p) => p,
@@ -215,7 +226,9 @@ pub async fn get_master_playlist(
         .stream_engine()
         .refresh_hls_playback(&info_hash, file_idx, "hls-master")
         .await;
-    state.stream_engine().focus_torrent(&info_hash).await;
+    if !engine.handle.manages_playback_lifecycle() {
+        state.stream_engine().focus_torrent(&info_hash).await;
+    }
 
     let stream_url = hls_stream_url(&state.base_url, &info_hash, file_idx);
 
@@ -468,12 +481,16 @@ async fn get_segment(
 
     // Use local file path only if the file is fully downloaded.
     // If not fully downloaded, stream via HTTP loopback to trigger piece downloading on demand.
-    let stats = engine.handle.stats().await;
-    let is_fully_downloaded = stats
-        .files
-        .get(file_idx)
-        .map(|f| f.progress >= 0.99)
-        .unwrap_or(false);
+    let is_fully_downloaded = if engine.handle.manages_playback_lifecycle() {
+        engine.handle.is_file_complete(file_idx).await
+    } else {
+        let stats = engine.handle.stats().await;
+        stats
+            .files
+            .get(file_idx)
+            .map(|f| f.progress >= 0.99)
+            .unwrap_or(false)
+    };
 
     let transcode_input_path = if is_fully_downloaded {
         engine
@@ -652,6 +669,10 @@ pub async fn get_probe(
         None => return (StatusCode::NOT_FOUND, "Engine not found").into_response(),
     };
 
+    state
+        .stream_engine()
+        .refresh_hls_playback(&info_hash, file_idx, "hls-probe")
+        .await;
     let stream_url = hls_stream_url(&state.base_url, &info_hash, file_idx);
     let probe = match engine.get_probe_result(file_idx, &stream_url).await {
         Ok(p) => p,
@@ -701,6 +722,10 @@ pub async fn get_tracks_by_url(State(state): State<AppState>, Path(url): Path<St
             None => return (StatusCode::NOT_FOUND, "Engine not found").into_response(),
         };
 
+        state
+            .stream_engine()
+            .refresh_hls_playback(&info_hash, file_idx, "hls-tracks")
+            .await;
         let stream_url = hls_stream_url(&state.base_url, &info_hash, file_idx);
         let probe = match engine.get_probe_result(file_idx, &stream_url).await {
             Ok(probe) => probe,
@@ -713,7 +738,7 @@ pub async fn get_tracks_by_url(State(state): State<AppState>, Path(url): Path<St
     let (info_hash, requested_idx) = match compat::parse_media_url(&media_url) {
         Ok(parts) => parts,
         Err(err) => {
-            tracing::warn!(error = %err, media_url = %media_url, "tracks URL parse failed");
+            tracing::warn!(error = %err, path = media_url.split('?').next(), "tracks URL parse failed");
             return Json(Vec::<serde_json::Value>::new()).into_response();
         }
     };
@@ -725,14 +750,18 @@ pub async fn get_tracks_by_url(State(state): State<AppState>, Path(url): Path<St
     let file_idx = match resolve_hls_file_idx(&engine, &requested_idx, &media_url).await {
         Ok(idx) => idx,
         Err(err) => {
-            tracing::warn!(error = %err, media_url = %media_url, "tracks file index resolve failed");
+            tracing::warn!(error = %err, path = media_url.split('?').next(), "tracks file index resolve failed");
             return Json(Vec::<serde_json::Value>::new()).into_response();
         }
     };
+    state
+        .stream_engine()
+        .refresh_hls_playback(&info_hash, file_idx, "hls-tracks-url")
+        .await;
     let probe = match engine.get_probe_result(file_idx, &media_url).await {
         Ok(probe) => probe,
         Err(err) => {
-            tracing::warn!(error = %err, media_url = %media_url, "tracks probe failed");
+            tracing::warn!(error = %err, path = media_url.split('?').next(), "tracks probe failed");
             return Json(Vec::<serde_json::Value>::new()).into_response();
         }
     };

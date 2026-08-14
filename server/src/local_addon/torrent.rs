@@ -220,7 +220,7 @@ impl Sha1 {
         let mut d = self.h[3];
         let mut e = self.h[4];
 
-        for i in 0..80 {
+        for (i, word) in w.iter().copied().enumerate() {
             let (f, k) = if i < 20 {
                 ((b & c) | (!b & d), 0x5A827999)
             } else if i < 40 {
@@ -236,7 +236,7 @@ impl Sha1 {
                 .wrapping_add(f)
                 .wrapping_add(e)
                 .wrapping_add(k)
-                .wrapping_add(w[i]);
+                .wrapping_add(word);
             e = d;
             d = c;
             c = b.rotate_left(30);
