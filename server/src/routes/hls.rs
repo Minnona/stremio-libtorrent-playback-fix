@@ -875,7 +875,7 @@ pub async fn legacy_hls_resource(
     };
     let file_idx = match resolve_legacy_file_idx(&state, &info_hash, &requested_idx).await {
         Ok(idx) => idx,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
 
     match resource.as_str() {
@@ -969,7 +969,7 @@ pub async fn legacy_hls_segment(
     };
     let file_idx = match resolve_legacy_file_idx(&state, &info_hash, &requested_idx).await {
         Ok(idx) => idx,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
 
     if variant.starts_with("mp4stream") {
@@ -998,7 +998,7 @@ async fn resolve_legacy_file_idx(
     state: &AppState,
     info_hash: &str,
     requested_idx: &str,
-) -> Result<usize, Response> {
+) -> Result<usize, Box<Response>> {
     if let Ok(idx) = requested_idx.parse::<usize>() {
         return Ok(idx);
     }
@@ -1008,15 +1008,17 @@ async fn resolve_legacy_file_idx(
         .get_or_add_engine(info_hash)
         .await
         .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to load engine: {}", e),
+            Box::new(
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to load engine: {}", e),
+                )
+                    .into_response(),
             )
-                .into_response()
         })?;
     resolve_hls_file_idx(&engine, requested_idx, "")
         .await
-        .map_err(|err| (StatusCode::NOT_FOUND, err).into_response())
+        .map_err(|err| Box::new((StatusCode::NOT_FOUND, err).into_response()))
 }
 
 fn legacy_stream_playlist(resource: &str) -> bool {

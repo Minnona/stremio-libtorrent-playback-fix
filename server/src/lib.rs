@@ -1,7 +1,7 @@
 use anyhow::Context;
 use axum::{Router, extract::State, http::StatusCode, response::Redirect, routing::get};
 use enginefs::EngineFS;
-use state::AppState;
+pub use state::AppState;
 use std::{
     future::{IntoFuture, pending},
     io::IsTerminal,
@@ -585,165 +585,7 @@ async fn run_inner(
         tui::start_tui(Arc::new(state.clone()), rx, shutdown_tx);
     }
 
-    fn peer_from_request(req: &axum::extract::Request) -> Option<SocketAddr> {
-        req.extensions()
-            .get::<axum::extract::ConnectInfo<SocketAddr>>()
-            .map(|info| info.0)
-    }
-
-    async fn fallback_handler(req: axum::extract::Request) -> impl axum::response::IntoResponse {
-        diagnostics::logging::log_unhandled(
-            "no matching route (404)",
-            StatusCode::NOT_FOUND.as_u16(),
-            peer_from_request(&req),
-            req.method(),
-            req.uri(),
-            Some(req.version()),
-            req.headers(),
-        );
-        StatusCode::NOT_FOUND
-    }
-
-    async fn method_not_allowed_handler(
-        req: axum::extract::Request,
-    ) -> impl axum::response::IntoResponse {
-        diagnostics::logging::log_unhandled(
-            "method not allowed for matched route (405)",
-            StatusCode::METHOD_NOT_ALLOWED.as_u16(),
-            peer_from_request(&req),
-            req.method(),
-            req.uri(),
-            Some(req.version()),
-            req.headers(),
-        );
-        StatusCode::METHOD_NOT_ALLOWED
-    }
-
-    let app = Router::new()
-        .route("/", get(root_redirect))
-        .route("/heartbeat", get(routes::system::heartbeat))
-        .route("/stats.json", get(routes::system::get_stats))
-        .route("/network-info", get(routes::system::network_info))
-        .nest("/update", routes::update::router())
-        .route("/diagnostics/memory", get(diagnostics::memory))
-        .route("/diagnostics/streams", get(diagnostics::streams))
-        .route("/diagnostics/crashes", get(diagnostics::crashes))
-        .route("/diagnostics/logs", get(diagnostics::logs))
-        .route("/diagnostics/logs/current", get(diagnostics::current_log))
-        .route("/diagnostics/export", get(diagnostics::export))
-        .route(
-            "/settings",
-            get(routes::system::get_settings).post(routes::system::set_settings),
-        )
-        .route("/list", get(routes::engine::list_engines))
-        .route("/removeAll", get(routes::engine::remove_all_engines))
-        .route(
-            "/create",
-            get(routes::engine::create_engine).post(routes::engine::create_engine),
-        )
-        .route(
-            "/{infoHash}/create",
-            get(routes::engine::create_magnet_get).post(routes::engine::create_magnet),
-        )
-        .nest("/{ipc_key}/downloader", routes::downloader::router())
-        .route("/{infoHash}/remove", get(routes::engine::remove_engine))
-        .route(
-            "/{infoHash}/stats.json",
-            get(routes::system::get_engine_stats),
-        )
-        .route(
-            "/{infoHash}/{idx}/stats.json",
-            get(routes::system::get_file_stats),
-        )
-        .route("/{infoHash}/peers", get(routes::peers::get_peers))
-        .route(
-            "/stream/{infoHash}/{fileIdx}",
-            get(routes::stream::stream_video).head(routes::stream::head_stream_video),
-        )
-        .route(
-            "/{infoHash}/{fileIdx}",
-            get(routes::stream::stream_video).head(routes::stream::head_stream_video),
-        )
-        .route(
-            "/subtitles.vtt",
-            get(routes::subtitles::proxy_subtitles_vtt),
-        )
-        .route(
-            "/subtitles.{ext}",
-            get(routes::subtitles::proxy_subtitles_ext),
-        )
-        .route(
-            "/{infoHash}/{fileIdx}/subtitles.vtt",
-            get(routes::subtitles::get_subtitles_vtt),
-        )
-        .route("/opensubHash", get(routes::subtitles::opensub_hash))
-        .route(
-            "/opensubHash/{infoHash}/{fileIdx}",
-            get(routes::subtitles::opensub_hash_path),
-        )
-        .route("/subtitlesTracks", get(routes::subtitles::subtitles_tracks))
-        .route("/device-info", get(routes::system::get_device_info))
-        .route("/hwaccel-profiler", get(routes::system::hwaccel_profiler))
-        .route("/get-https", get(routes::system::get_https))
-        .nest("/yt", routes::youtube::router())
-        .nest("/rar", routes::archive::router())
-        .nest("/zip", routes::archive::router())
-        .nest("/7zip", routes::archive::router())
-        .nest("/tar", routes::archive::router())
-        .nest("/tgz", routes::archive::router())
-        .nest("/nzb", routes::nzb::router())
-        .nest("/local-addon", local_addon::get_router())
-        .nest("/proxy", routes::proxy::router())
-        .nest("/ftp", routes::ftp::router())
-        .route("/samples/{filename}", get(routes::system::get_samples))
-        .route("/hlsv2/status", get(routes::hls::hls_status))
-        .route("/hlsv2/{id}/destroy", get(routes::hls::hls_destroy))
-        .route("/hlsv2/{id}/burn", get(routes::hls::hls_burn))
-        .route(
-            "/hlsv2/{hash}/master.m3u8",
-            get(routes::hls::master_playlist_by_url),
-        )
-        .route("/hlsv2/{id}/{resource}", get(routes::hls::hls_v2_resource))
-        .route(
-            "/hlsv2/{infoHash}/{fileIdx}/master.m3u8",
-            get(routes::hls::get_master_playlist),
-        )
-        .route(
-            "/hlsv2/{infoHash}/{fileIdx}/{resource}",
-            get(routes::hls::handle_hls_resource),
-        )
-        .route(
-            "/hlsv2/{infoHash}/{fileIdx}/{track}/{segment}",
-            get(routes::hls::handle_hls_fmp4_segment),
-        )
-        .route("/hlsv2/probe", get(routes::hls::probe_by_url))
-        .route("/probe", get(routes::hls::probe_by_url))
-        .route("/probe/{infoHash}/{fileIdx}", get(routes::hls::get_probe))
-        .route("/tracks/{*url}", get(routes::hls::get_tracks_by_url))
-        .route(
-            "/{first}/{second}/{resource}",
-            get(routes::hls::legacy_hls_resource),
-        )
-        .route(
-            "/{first}/{second}/{variant}/{seg}",
-            get(routes::hls::legacy_hls_segment),
-        )
-        .route("/thumb.jpg", get(|| async { StatusCode::NOT_FOUND }))
-        .nest("/casting", routes::casting::router())
-        .route("/favicon.ico", get(|| async { StatusCode::NOT_FOUND }))
-        .fallback(fallback_handler)
-        .method_not_allowed_fallback(method_not_allowed_handler)
-        .layer(
-            TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
-                tracing::info_span!(
-                    "request",
-                    method = %request.method(),
-                    path = request.uri().path(),
-                )
-            }),
-        )
-        .layer(CorsLayer::permissive())
-        .with_state(state);
+    let app = build_router(state);
 
     tracing::info!("listening on {}", bound_http_addr);
     if cfg.print_startup {
@@ -885,6 +727,168 @@ fn connectable_addr(addr: SocketAddr) -> SocketAddr {
         }
         _ => addr,
     }
+}
+
+pub fn build_router(state: AppState) -> Router {
+    fn peer_from_request(req: &axum::extract::Request) -> Option<SocketAddr> {
+        req.extensions()
+            .get::<axum::extract::ConnectInfo<SocketAddr>>()
+            .map(|info| info.0)
+    }
+
+    async fn fallback_handler(req: axum::extract::Request) -> impl axum::response::IntoResponse {
+        diagnostics::logging::log_unhandled(
+            "no matching route (404)",
+            StatusCode::NOT_FOUND.as_u16(),
+            peer_from_request(&req),
+            req.method(),
+            req.uri(),
+            Some(req.version()),
+            req.headers(),
+        );
+        StatusCode::NOT_FOUND
+    }
+
+    async fn method_not_allowed_handler(
+        req: axum::extract::Request,
+    ) -> impl axum::response::IntoResponse {
+        diagnostics::logging::log_unhandled(
+            "method not allowed for matched route (405)",
+            StatusCode::METHOD_NOT_ALLOWED.as_u16(),
+            peer_from_request(&req),
+            req.method(),
+            req.uri(),
+            Some(req.version()),
+            req.headers(),
+        );
+        StatusCode::METHOD_NOT_ALLOWED
+    }
+
+    Router::new()
+        .route("/", get(root_redirect))
+        .route("/heartbeat", get(routes::system::heartbeat))
+        .route("/stats.json", get(routes::system::get_stats))
+        .route("/network-info", get(routes::system::network_info))
+        .nest("/update", routes::update::router())
+        .route("/diagnostics/memory", get(diagnostics::memory))
+        .route("/diagnostics/streams", get(diagnostics::streams))
+        .route("/diagnostics/crashes", get(diagnostics::crashes))
+        .route("/diagnostics/logs", get(diagnostics::logs))
+        .route("/diagnostics/logs/current", get(diagnostics::current_log))
+        .route("/diagnostics/export", get(diagnostics::export))
+        .route(
+            "/settings",
+            get(routes::system::get_settings).post(routes::system::set_settings),
+        )
+        .route("/list", get(routes::engine::list_engines))
+        .route("/removeAll", get(routes::engine::remove_all_engines))
+        .route(
+            "/create",
+            get(routes::engine::create_engine).post(routes::engine::create_engine),
+        )
+        .route(
+            "/{infoHash}/create",
+            get(routes::engine::create_magnet_get).post(routes::engine::create_magnet),
+        )
+        .nest("/{ipc_key}/downloader", routes::downloader::router())
+        .route("/{infoHash}/remove", get(routes::engine::remove_engine))
+        .route(
+            "/{infoHash}/stats.json",
+            get(routes::system::get_engine_stats),
+        )
+        .route(
+            "/{infoHash}/{idx}/stats.json",
+            get(routes::system::get_file_stats),
+        )
+        .route("/{infoHash}/peers", get(routes::peers::get_peers))
+        .route(
+            "/stream/{infoHash}/{fileIdx}",
+            get(routes::stream::stream_video).head(routes::stream::head_stream_video),
+        )
+        .route(
+            "/{infoHash}/{fileIdx}",
+            get(routes::stream::stream_video).head(routes::stream::head_stream_video),
+        )
+        .route(
+            "/subtitles.vtt",
+            get(routes::subtitles::proxy_subtitles_vtt),
+        )
+        .route(
+            "/subtitles.{ext}",
+            get(routes::subtitles::proxy_subtitles_ext),
+        )
+        .route(
+            "/{infoHash}/{fileIdx}/subtitles.vtt",
+            get(routes::subtitles::get_subtitles_vtt),
+        )
+        .route("/opensubHash", get(routes::subtitles::opensub_hash))
+        .route(
+            "/opensubHash/{infoHash}/{fileIdx}",
+            get(routes::subtitles::opensub_hash_path),
+        )
+        .route("/subtitlesTracks", get(routes::subtitles::subtitles_tracks))
+        .route("/device-info", get(routes::system::get_device_info))
+        .route("/hwaccel-profiler", get(routes::system::hwaccel_profiler))
+        .route("/get-https", get(routes::system::get_https))
+        .nest("/yt", routes::youtube::router())
+        .nest("/rar", routes::archive::router())
+        .nest("/zip", routes::archive::router())
+        .nest("/7zip", routes::archive::router())
+        .nest("/tar", routes::archive::router())
+        .nest("/tgz", routes::archive::router())
+        .nest("/nzb", routes::nzb::router())
+        .nest("/local-addon", local_addon::get_router())
+        .nest("/proxy", routes::proxy::router())
+        .nest("/ftp", routes::ftp::router())
+        .route("/samples/{filename}", get(routes::system::get_samples))
+        .route("/hlsv2/status", get(routes::hls::hls_status))
+        .route("/hlsv2/{id}/destroy", get(routes::hls::hls_destroy))
+        .route("/hlsv2/{id}/burn", get(routes::hls::hls_burn))
+        .route(
+            "/hlsv2/{hash}/master.m3u8",
+            get(routes::hls::master_playlist_by_url),
+        )
+        .route("/hlsv2/{id}/{resource}", get(routes::hls::hls_v2_resource))
+        .route(
+            "/hlsv2/{infoHash}/{fileIdx}/master.m3u8",
+            get(routes::hls::get_master_playlist),
+        )
+        .route(
+            "/hlsv2/{infoHash}/{fileIdx}/{resource}",
+            get(routes::hls::handle_hls_resource),
+        )
+        .route(
+            "/hlsv2/{infoHash}/{fileIdx}/{track}/{segment}",
+            get(routes::hls::handle_hls_fmp4_segment),
+        )
+        .route("/hlsv2/probe", get(routes::hls::probe_by_url))
+        .route("/probe", get(routes::hls::probe_by_url))
+        .route("/probe/{infoHash}/{fileIdx}", get(routes::hls::get_probe))
+        .route("/tracks/{*url}", get(routes::hls::get_tracks_by_url))
+        .route(
+            "/{first}/{second}/{resource}",
+            get(routes::hls::legacy_hls_resource),
+        )
+        .route(
+            "/{first}/{second}/{variant}/{seg}",
+            get(routes::hls::legacy_hls_segment),
+        )
+        .route("/thumb.jpg", get(|| async { StatusCode::NOT_FOUND }))
+        .nest("/casting", routes::casting::router())
+        .route("/favicon.ico", get(|| async { StatusCode::NOT_FOUND }))
+        .fallback(fallback_handler)
+        .method_not_allowed_fallback(method_not_allowed_handler)
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
+                tracing::info_span!(
+                    "request",
+                    method = %request.method(),
+                    path = request.uri().path(),
+                )
+            }),
+        )
+        .layer(CorsLayer::permissive())
+        .with_state(state)
 }
 
 async fn root_redirect(State(state): State<AppState>) -> Redirect {

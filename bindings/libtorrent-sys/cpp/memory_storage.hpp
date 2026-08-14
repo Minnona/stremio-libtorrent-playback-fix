@@ -13,6 +13,7 @@
 #include <libtorrent/add_torrent_params.hpp>
 #include <libtorrent/session.hpp>
 #include <libtorrent/io_context.hpp>
+#include <libtorrent/version.hpp>
 
 #include "rust/cxx.h"
 
@@ -47,6 +48,9 @@ public:
     
     // ========== buffer_allocator_interface ==========
     void free_disk_buffer(char* buf) override;
+#if LIBTORRENT_VERSION_NUM >= 20100
+    void free_multiple_buffers(lt::span<char*> bufs) override;
+#endif
     
     // ========== disk_interface: Torrent lifecycle ==========
     lt::storage_holder new_torrent(lt::storage_params const& p,

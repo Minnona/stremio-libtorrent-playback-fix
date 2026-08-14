@@ -9,13 +9,12 @@
 #include <libtorrent/alert_types.hpp>
 #include <libtorrent/announce_entry.hpp>
 #include <libtorrent/aux_/session_impl.hpp>
-#include <libtorrent/bencode.hpp>
-#include <libtorrent/create_torrent.hpp>
 #include <libtorrent/extensions.hpp>
 #include <libtorrent/extensions/smart_ban.hpp>
 #include <libtorrent/extensions/ut_metadata.hpp>
 #include <libtorrent/extensions/ut_pex.hpp>
 #include <libtorrent/hex.hpp>
+#include <libtorrent/load_torrent.hpp>
 #include <libtorrent/magnet_uri.hpp>
 #include <libtorrent/peer_info.hpp>
 #include <libtorrent/read_resume_data.hpp>
@@ -26,6 +25,7 @@
 #include <libtorrent/write_resume_data.hpp>
 
 #include <chrono>
+#include <cstddef>
 #include <iterator>
 #include <sstream>
 #include <utility>
@@ -506,11 +506,13 @@ session_add_torrent(Session &session, AddTorrentParams const &params) {
 
   if (!params.torrent_data.empty()) {
     lt::error_code ec;
-    p.ti = std::make_shared<lt::torrent_info>(
-        reinterpret_cast<const char *>(params.torrent_data.data()),
-        static_cast<int>(params.torrent_data.size()), ec);
+    auto loaded = lt::load_torrent_buffer(
+        {reinterpret_cast<const char *>(params.torrent_data.data()),
+         static_cast<std::ptrdiff_t>(params.torrent_data.size())},
+        ec, lt::load_torrent_limits{});
     if (ec)
       throw std::runtime_error("Failed to parse torrent: " + ec.message());
+    p.ti = std::move(loaded.ti);
   }
 
   p.save_path = rust_str_to_std(params.save_path);
@@ -735,7 +737,7 @@ bool session_wait_for_alert(Session const &session, int32_t timeout_ms) {
   // wait_for_alert is actually non-const in libtorrent, but we cast away const
   // for this query
   return const_cast<lt::session &>(session.session)
-             .wait_for_alert(std::chrono::milliseconds(timeout_ms)) != nullptr;
+      .wait_for_alert(std::chrono::milliseconds(timeout_ms));
 }
 
 void session_set_alert_mask(Session &session, uint32_t mask) {
@@ -867,8 +869,13 @@ void handle_force_reannounce_with_flags(TorrentHandle &handle,
                                         bool high_priority,
                                         bool ignore_min_interval) {
   auto flags = lt::reannounce_flags_t{};
+#if LIBTORRENT_VERSION_NUM >= 20012
   if (high_priority)
     flags |= lt::torrent_handle::high_priority;
+#else
+  // high_priority was added in libtorrent 2.0.12.
+  (void)high_priority;
+#endif
   if (ignore_min_interval)
     flags |= lt::torrent_handle::ignore_min_interval;
   handle.handle.force_reannounce(0, -1, flags);
@@ -933,7 +940,7 @@ rust::Vec<FileInfo> handle_get_files(TorrentHandle const &handle) {
     return result;
 
   auto ts = handle.handle.status();
-  const lt::file_storage &files = ti->files();
+  const lt::file_storage &files = ti->layout();
   auto file_progress = handle.handle.file_progress();
   auto priorities = handle.handle.get_file_priorities();
 
@@ -1057,8 +1064,9 @@ rust::Vec<PeerInfo> handle_get_peers(TorrentHandle const &handle) {
 
   for (const auto &p : peers) {
     PeerInfo info;
-    info.ip = rust::String(p.ip.address().to_string());
-    info.port = p.ip.port();
+    auto const endpoint = p.remote_endpoint();
+    info.ip = rust::String(endpoint.address().to_string());
+    info.port = endpoint.port();
     info.client = rust::String(p.client);
     info.download_rate = p.down_speed;
     info.upload_rate = p.up_speed;
@@ -1176,19 +1184,24 @@ AddTorrentParams parse_magnet_uri(rust::Str uri) {
 
 rust::Vec<uint8_t> handle_get_metadata(TorrentHandle const &handle) {
   rust::Vec<uint8_t> result;
-  auto ti = handle.handle.torrent_file();
-  if (ti) {
-    lt::create_torrent ct(*ti);
-    std::vector<char> buf;
-    lt::bencode(std::back_inserter(buf), ct.generate());
-    for (char c : buf)
-      result.push_back(static_cast<uint8_t>(c));
-  }
+  if (!handle.handle.torrent_file())
+    return result;
+
+  auto const params =
+      handle.handle.get_resume_data(lt::torrent_handle::save_info_dict);
+  auto const buf = lt::write_torrent_file_buf(
+      params, lt::write_flags::allow_missing_piece_layer);
+  for (char c : buf)
+    result.push_back(static_cast<uint8_t>(c));
   return result;
 }
 
 rust::String make_magnet_uri(TorrentHandle const &handle) {
-  return rust::String(lt::make_magnet_uri(handle.handle));
+  if (!handle.handle.is_valid())
+    return rust::String();
+
+  auto const params = handle.handle.get_resume_data();
+  return rust::String(lt::make_magnet_uri(params));
 }
 
 rust::String libtorrent_version() { return rust::String(lt::version()); }

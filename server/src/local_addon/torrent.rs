@@ -196,9 +196,9 @@ impl Sha1 {
     }
 
     fn update(&mut self, data: &[u8]) {
-        let mut chunks = data.chunks_exact(64);
-        for chunk in chunks.by_ref() {
-            self.process_chunk(chunk.try_into().unwrap());
+        let (chunks, _) = data.as_chunks::<64>();
+        for chunk in chunks {
+            self.process_chunk(chunk);
         }
         // Handle last chunk is done by caller usually, but here we do simple one-shot style or simple chunking?
         // Actually, for full SHA1 we need padding.
@@ -206,8 +206,8 @@ impl Sha1 {
 
     fn process_chunk(&mut self, chunk: &[u8; 64]) {
         let mut w = [0u32; 80];
-        for (i, v) in chunk.chunks_exact(4).enumerate() {
-            w[i] = u32::from_be_bytes(v.try_into().unwrap());
+        for (i, value) in chunk.as_chunks::<4>().0.iter().enumerate() {
+            w[i] = u32::from_be_bytes(*value);
         }
         for i in 16..80 {
             let x = w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16];

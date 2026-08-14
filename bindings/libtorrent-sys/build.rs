@@ -1,12 +1,16 @@
 fn main() {
-    let (include_paths, using_vcpkg) = find_libtorrent();
+    let libtorrent = find_libtorrent();
 
     // Build the cxx bridge
     let mut build = cxx_build::bridge("src/lib.rs");
 
     // Add libtorrent include paths
-    for path in include_paths {
+    for path in &libtorrent.include_paths {
         build.include(path);
+    }
+
+    for (name, value) in &libtorrent.defines {
+        build.define(name, value.as_deref());
     }
 
     // Add our C++ wrapper
@@ -18,11 +22,7 @@ fn main() {
         .flag_if_supported("-Wno-missing-field-initializers")
         .flag_if_supported("-Wno-maybe-uninitialized");
 
-    // Only set TORRENT_ABI_VERSION when using vcpkg-built libtorrent
-    // System packages (e.g., Arch Linux) usually don't need this specific ABI version 3
-    if using_vcpkg {
-        build.define("TORRENT_ABI_VERSION", "3");
-
+    if libtorrent.using_vcpkg {
         // Ensure static linking definitions are present for vcpkg builds
         // These are critical for both Windows and Linux to avoid linker errors
         build.define("TORRENT_LINKING_STATIC", None);
@@ -52,22 +52,34 @@ fn main() {
     println!("cargo:rerun-if-changed=cpp/memory_storage.cpp");
 }
 
-/// Returns (include_paths, using_vcpkg)
-fn find_libtorrent() -> (Vec<std::path::PathBuf>, bool) {
+struct LibtorrentConfig {
+    include_paths: Vec<std::path::PathBuf>,
+    using_vcpkg: bool,
+    defines: Vec<(String, Option<String>)>,
+}
+
+fn find_libtorrent() -> LibtorrentConfig {
     let mut errors = String::new();
 
     // Try pkg-config first
-    match pkg_config::Config::new()
-        .atleast_version("2.0")
-        .probe("libtorrent-rasterbar")
-    {
+    let mut pkg_config = pkg_config::Config::new();
+    pkg_config.atleast_version("2.1.1");
+    if std::env::var_os("LIBTORRENT_STATIC").is_some() {
+        pkg_config.statik(true);
+    }
+
+    match pkg_config.probe("libtorrent-rasterbar") {
         Ok(lib) => {
             // Check if this is a vcpkg-installed library by looking at the path
             let is_vcpkg = lib
                 .include_paths
                 .iter()
                 .any(|p| p.to_string_lossy().contains("vcpkg_installed"));
-            return (lib.include_paths, is_vcpkg);
+            return LibtorrentConfig {
+                include_paths: lib.include_paths,
+                using_vcpkg: is_vcpkg,
+                defines: lib.defines.into_iter().collect(),
+            };
         }
         Err(e) => {
             errors.push_str(&format!("pkg-config: {}\n", e));
@@ -102,7 +114,13 @@ fn find_libtorrent() -> (Vec<std::path::PathBuf>, bool) {
             .emit_includes(true)
             .find_package(package)
         {
-            Ok(lib) => return (lib.include_paths, true),
+            Ok(lib) => {
+                return LibtorrentConfig {
+                    include_paths: lib.include_paths,
+                    using_vcpkg: true,
+                    defines: Vec::new(),
+                };
+            }
             Err(e) => {
                 errors.push_str(&format!("vcpkg ({}): {}\n", package, e));
             }
@@ -132,7 +150,11 @@ fn find_libtorrent() -> (Vec<std::path::PathBuf>, bool) {
                     println!("cargo:rustc-link-lib=iphlpapi");
                     println!("cargo:rustc-link-lib=dbghelp");
                 }
-                return (vec![include_path], true);
+                return LibtorrentConfig {
+                    include_paths: vec![include_path],
+                    using_vcpkg: true,
+                    defines: Vec::new(),
+                };
             }
         }
     }

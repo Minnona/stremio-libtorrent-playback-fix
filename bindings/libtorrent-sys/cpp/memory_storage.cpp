@@ -40,6 +40,13 @@ void memory_disk_io::free_disk_buffer(char *buf) {
   delete[] buf;
 }
 
+#if LIBTORRENT_VERSION_NUM >= 20100
+void memory_disk_io::free_multiple_buffers(lt::span<char *> bufs) {
+  for (char *buf : bufs)
+    free_disk_buffer(buf);
+}
+#endif
+
 char *memory_disk_io::allocate_buffer() {
   // Allocate a 16KB block (standard libtorrent block size)
   return new char[16 * 1024];
@@ -209,7 +216,11 @@ void memory_disk_io::async_read(
   char *buf = new char[result.size()];
   std::memcpy(buf, result.data(), result.size());
 
+#if LIBTORRENT_VERSION_NUM >= 20100
+  lt::disk_buffer_holder holder(*this, buf);
+#else
   lt::disk_buffer_holder holder(*this, buf, static_cast<int>(result.size()));
+#endif
 
   boost::asio::post(m_ioc, [handler, h = std::move(holder)]() mutable {
     handler(std::move(h), lt::storage_error());
@@ -293,7 +304,11 @@ void memory_disk_io::async_move_storage(
         handler) {
   // No-op for memory storage
   boost::asio::post(m_ioc, [handler, p = std::move(p)]() {
+#if LIBTORRENT_VERSION_NUM >= 20100
+    handler(lt::status_t{}, p, lt::storage_error());
+#else
     handler(lt::status_t::no_error, p, lt::storage_error());
+#endif
   });
 }
 
@@ -311,7 +326,11 @@ void memory_disk_io::async_check_files(
     std::function<void(lt::status_t, lt::storage_error const &)> handler) {
   // For memory storage, always report no pieces (fresh start)
   boost::asio::post(m_ioc, [handler]() {
+#if LIBTORRENT_VERSION_NUM >= 20100
+    handler(lt::status_t{}, lt::storage_error());
+#else
     handler(lt::status_t::no_error, lt::storage_error());
+#endif
   });
 }
 

@@ -4,7 +4,7 @@ Rust FFI bindings to [libtorrent-rasterbar](https://libtorrent.org/) via [cxx](h
 
 ## Requirements
 
-- **libtorrent-rasterbar** 2.0+
+- **libtorrent-rasterbar** 2.1.1+
 - **Boost** (headers)
 - **C++17** compiler
 - **pkg-config**
