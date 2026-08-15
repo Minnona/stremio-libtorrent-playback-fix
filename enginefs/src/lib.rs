@@ -1249,12 +1249,24 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
     }
 
     async fn schedule_file_cleanup(&self, info_hash: String, file_idx: usize) {
+        drop(
+            self.schedule_file_cleanup_after(info_hash, file_idx, Duration::from_secs(5))
+                .await,
+        );
+    }
+
+    async fn schedule_file_cleanup_after(
+        &self,
+        info_hash: String,
+        file_idx: usize,
+        delay: Duration,
+    ) -> Option<tokio::task::JoinHandle<()>> {
         if self
             .get_engine(&info_hash)
             .await
             .is_some_and(|engine| engine.handle.manages_playback_lifecycle())
         {
-            return;
+            return None;
         }
         let engines = self.engines.clone();
         let active_file = self.active_file.clone();
@@ -1269,8 +1281,8 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                 .map(|selection| selection.generation)
         };
 
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(5)).await;
+        Some(tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
 
             let key = (info_hash.clone(), file_idx);
             let still_active = {
@@ -1393,7 +1405,7 @@ impl<B: TorrentBackend + 'static> BackendEngineFS<B> {
                     );
                 }
             }
-        });
+        }))
     }
 
     /// Get a reference to the backend for direct access
@@ -2010,10 +2022,11 @@ mod tests {
         let (enginefs, counters) = test_enginefs();
 
         enginefs.refresh_hls_playback(TEST_HASH, 0, "test").await;
-        enginefs
-            .schedule_file_cleanup(TEST_HASH.to_string(), 0)
-            .await;
-        tokio::time::sleep(Duration::from_secs(6)).await;
+        let cleanup = enginefs
+            .schedule_file_cleanup_after(TEST_HASH.to_string(), 0, Duration::from_millis(10))
+            .await
+            .expect("cleanup task");
+        cleanup.await.expect("cleanup task completed");
 
         assert_eq!(counters.clear_file_streaming.load(Ordering::SeqCst), 0);
     }
@@ -2030,10 +2043,11 @@ mod tests {
                 .unwrap()
                 .expires_at_secs = now_secs();
         }
-        enginefs
-            .schedule_file_cleanup(TEST_HASH.to_string(), 0)
-            .await;
-        tokio::time::sleep(Duration::from_secs(6)).await;
+        let cleanup = enginefs
+            .schedule_file_cleanup_after(TEST_HASH.to_string(), 0, Duration::from_millis(10))
+            .await
+            .expect("cleanup task");
+        cleanup.await.expect("cleanup task completed");
 
         assert_eq!(counters.clear_file_streaming.load(Ordering::SeqCst), 1);
     }
