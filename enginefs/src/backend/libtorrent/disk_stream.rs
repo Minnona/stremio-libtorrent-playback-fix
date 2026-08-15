@@ -34,6 +34,13 @@ fn broker_slice_bounds(
     (len != 0).then_some((offset, offset + len))
 }
 
+fn piece_is_missing(presence: &[u8], first: i32, piece: i32) -> bool {
+    usize::try_from(piece.saturating_sub(first))
+        .ok()
+        .and_then(|index| presence.get(index))
+        .is_none_or(|present| *present == 0)
+}
+
 pub(crate) struct LibtorrentDiskFileStream {
     handle: libtorrent_sys::LibtorrentHandle,
     info_hash: String,
@@ -63,6 +70,7 @@ pub(crate) struct LibtorrentDiskFileStream {
     seek_pending: bool,
     open_file: Option<tokio::task::JoinHandle<std::io::Result<tokio::fs::File>>>,
     scratch: Vec<u8>,
+    verified_piece: Option<i32>,
     broker_piece: Option<(i32, Arc<Vec<u8>>)>,
     piece_read: Option<(i32, PieceReadTask)>,
     piece_read_retry_at: Option<(i32, Instant)>,
@@ -125,6 +133,7 @@ impl LibtorrentDiskFileStream {
             seek_pending: false,
             open_file: None,
             scratch: vec![0; 256 * 1024],
+            verified_piece: None,
             broker_piece: None,
             piece_read: None,
             piece_read_retry_at: None,
@@ -247,6 +256,8 @@ impl LibtorrentDiskFileStream {
         let configured_forward_window =
             disk_backed_forward_window_pieces_for(priority_intent, self.piece_length);
         let forward_window = self.active_forward_window(priority_intent, configured_forward_window);
+        let window_end = self.last_piece.min(piece + forward_window);
+        let presence = self.handle.piece_presence(piece, window_end);
 
         // A tail-seek (Cues/moov) stream records its window as metadata-critical
         // so concurrent head streams rank it above their own read-ahead until it
@@ -257,9 +268,8 @@ impl LibtorrentDiskFileStream {
             PlaybackIntent::ContainerMetadata | PlaybackIntent::InternalProbe
         );
         if is_metadata_stream {
-            let window_end = self.last_piece.min(piece + forward_window);
             let window: Vec<i32> = (piece..=window_end)
-                .filter(|p| !self.handle.have_piece(*p))
+                .filter(|p| piece_is_missing(&presence, piece, *p))
                 .collect();
             self.metadata_pins.pin_pieces(&self.info_hash, window);
         }
@@ -279,24 +289,33 @@ impl LibtorrentDiskFileStream {
             4
         };
         let deadline_jitter = (self.stream_id % 10) as i32 * 5;
-        for p in piece..=self.last_piece.min(piece + forward_window) {
-            if !self.handle.have_piece(p) {
+        let assignments = (piece..=window_end)
+            .filter(|p| piece_is_missing(&presence, piece, *p))
+            .map(|p| {
                 let distance = p - piece;
                 let deadline = if distance == 0 {
                     0
                 } else {
                     distance * 250 + deadline_jitter
                 };
-                self.handle.set_piece_priority(
+                (
                     p,
                     if distance == 0 {
                         7
                     } else {
                         read_ahead_priority
                     },
-                );
-                self.handle.set_piece_deadline(p, deadline);
-            }
+                    deadline,
+                )
+            })
+            .collect::<Vec<_>>();
+        self.handle.set_piece_priorities(
+            assignments
+                .iter()
+                .map(|(piece, priority, _)| (*piece, *priority)),
+        );
+        for (piece, _, deadline) in assignments {
+            self.handle.set_piece_deadline(piece, deadline);
         }
         self.reassert_requested_piece(piece, "initial-window");
         // Re-assert pinned Cues/moov LAST so the set_file_priority above (and the
@@ -362,13 +381,22 @@ impl LibtorrentDiskFileStream {
         let mut forward_window =
             disk_backed_forward_window_pieces_for(priority_intent, self.piece_length);
         forward_window = self.active_forward_window(priority_intent, forward_window);
-        for p in piece..=self.last_piece.min(piece + forward_window) {
-            if !self.handle.have_piece(p) {
+        let window_end = self.last_piece.min(piece + forward_window);
+        let presence = self.handle.piece_presence(piece, window_end);
+        let assignments = (piece..=window_end)
+            .filter(|p| piece_is_missing(&presence, piece, *p))
+            .map(|p| {
                 let distance = p - piece;
-                self.handle
-                    .set_piece_priority(p, if distance == 0 { 7 } else { 4 });
-                self.handle.set_piece_deadline(p, distance * 250);
-            }
+                (p, if distance == 0 { 7 } else { 4 }, distance * 250)
+            })
+            .collect::<Vec<_>>();
+        self.handle.set_piece_priorities(
+            assignments
+                .iter()
+                .map(|(piece, priority, _)| (*piece, *priority)),
+        );
+        for (piece, _, deadline) in assignments {
+            self.handle.set_piece_deadline(piece, deadline);
         }
         self.reassert_requested_piece(piece, "blocked-replan");
         // Keep pinned Cues/moov urgent (deadline 0) so they out-rank this
@@ -410,28 +438,26 @@ impl LibtorrentDiskFileStream {
         if self.last_wait_log.elapsed() >= Duration::from_secs(5) {
             self.last_wait_log = Instant::now();
             let status = self.handle.status();
-            let verified_piece_count = (self.first_piece..=self.last_piece)
-                .filter(|p| self.handle.have_piece(*p))
-                .count();
-            let verified_bytes_estimate = (verified_piece_count as u64)
-                .saturating_mul(self.piece_length)
+            let verified_bytes_estimate = u64::try_from(status.total_wanted_done)
+                .unwrap_or(0)
                 .min(self.file_size);
+            let verified_piece_count = if self.piece_length == 0 {
+                0
+            } else {
+                verified_bytes_estimate.div_ceil(self.piece_length) as usize
+            };
             let configured_forward_window =
                 disk_backed_forward_window_pieces_for(self.playback_intent, self.piece_length);
             let active_forward_window =
                 self.active_forward_window(self.playback_intent, configured_forward_window);
             let cluster_end = self.last_piece.min(piece + active_forward_window);
-            let ready_in_active_window = (piece..=cluster_end)
-                .filter(|p| self.handle.have_piece(*p))
+            let active_presence = self.handle.piece_presence(piece, cluster_end);
+            let ready_in_active_window = active_presence
+                .iter()
+                .filter(|present| **present != 0)
                 .count();
             let missing_in_active_window =
                 (cluster_end.saturating_sub(piece) + 1).max(0) as usize - ready_in_active_window;
-            let piece_availability = self
-                .handle
-                .piece_availability()
-                .get(piece as usize)
-                .copied()
-                .unwrap_or(-1);
             let request_offset_percent = if self.file_size > 0 {
                 (self.current_pos.min(self.file_size) as f64 / self.file_size as f64) * 100.0
             } else {
@@ -450,7 +476,6 @@ impl LibtorrentDiskFileStream {
                 active_forward_window,
                 ready_in_active_window,
                 missing_in_active_window,
-                piece_availability,
                 peers = status.num_peers,
                 download_rate = status.download_rate,
                 paused = status.is_paused,
@@ -682,7 +707,7 @@ impl tokio::io::AsyncRead for LibtorrentDiskFileStream {
             )));
         }
 
-        if !self.handle.have_piece(piece) {
+        if self.verified_piece != Some(piece) && !self.handle.have_piece(piece) {
             self.request_piece_from_libtorrent(piece);
             if let Err(error) = self.poll_piece_broker(cx, piece) {
                 return Poll::Ready(Err(error));
@@ -692,6 +717,7 @@ impl tokio::io::AsyncRead for LibtorrentDiskFileStream {
             }
             return self.wait_for_piece(piece, cx);
         }
+        self.verified_piece = Some(piece);
 
         let verified_available = self.bytes_available_in_verified_piece(piece);
         if verified_available == 0 {
@@ -809,6 +835,7 @@ impl tokio::io::AsyncSeek for LibtorrentDiskFileStream {
 
         self.current_pos = new_pos.min(self.file_size);
         self.last_prioritized_piece = -1;
+        self.verified_piece = None;
         self.broker_piece = None;
         if let Some((_, task)) = self.piece_read.take() {
             task.abort();

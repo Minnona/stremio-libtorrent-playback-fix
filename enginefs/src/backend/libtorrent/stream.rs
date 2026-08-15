@@ -163,19 +163,6 @@ impl LibtorrentFileStream {
 
         self.last_priorities_piece = current_piece;
 
-        // Check if complete (all pieces downloaded)
-        let mut all_downloaded = true;
-        for p in self.first_piece..=self.last_piece {
-            if !self.handle.have_piece(p) {
-                all_downloaded = false;
-                break;
-            }
-        }
-        if all_downloaded {
-            self.is_complete = true;
-            return;
-        }
-
         // Use centralized priorities calculation
         // Calculate dynamic EMA for download speed to avoid priority oscillations
         let status = self.handle.status();
@@ -243,25 +230,27 @@ impl LibtorrentFileStream {
         // when multiple streams are active, their "earliest" pieces are interleaved.
         let jitter = (self.stream_id % 10) as i32 * 5; // Up to 50ms jitter
 
-        for item in decision.assignments {
-            if item.piece_idx >= self.first_piece
-                && item.piece_idx <= self.last_piece
-                && !self.handle.have_piece(item.piece_idx)
-            {
-                self.handle
-                    .set_piece_priority(item.piece_idx, item.piece_priority);
-
-                let shared_deadline = if item.deadline == 0 {
-                    0
-                } else if item.deadline >= 100000 {
-                    // Don't jitter very long background deadlines
-                    item.deadline
-                } else {
-                    item.deadline + jitter
-                };
-                self.handle
-                    .set_piece_deadline(item.piece_idx, shared_deadline);
-            }
+        let assignments = decision
+            .assignments
+            .into_iter()
+            .filter(|item| item.piece_idx >= self.first_piece && item.piece_idx <= self.last_piece)
+            .collect::<Vec<_>>();
+        self.handle.set_piece_priorities(
+            assignments
+                .iter()
+                .map(|item| (item.piece_idx, item.piece_priority)),
+        );
+        for item in assignments {
+            let shared_deadline = if item.deadline == 0 {
+                0
+            } else if item.deadline >= 100000 {
+                // Don't jitter very long background deadlines
+                item.deadline
+            } else {
+                item.deadline + jitter
+            };
+            self.handle
+                .set_piece_deadline(item.piece_idx, shared_deadline);
         }
     }
 
@@ -316,24 +305,24 @@ impl LibtorrentFileStream {
             first_byte_sent: self.first_read_logged,
         });
 
-        let mut applied = 0usize;
-        for assignment in &decision.assignments {
-            if assignment.band != PriorityBand::Immediate {
-                break;
-            }
-
-            if assignment.piece_idx < self.first_piece
-                || assignment.piece_idx > self.last_piece
-                || self.handle.have_piece(assignment.piece_idx)
-            {
-                continue;
-            }
-
-            self.handle.set_piece_priority(assignment.piece_idx, 7);
+        let assignments = decision
+            .assignments
+            .iter()
+            .take_while(|assignment| assignment.band == PriorityBand::Immediate)
+            .filter(|assignment| {
+                assignment.piece_idx >= self.first_piece && assignment.piece_idx <= self.last_piece
+            })
+            .collect::<Vec<_>>();
+        self.handle.set_piece_priorities(
+            assignments
+                .iter()
+                .map(|assignment| (assignment.piece_idx, 7)),
+        );
+        for assignment in &assignments {
             self.handle
                 .set_piece_deadline(assignment.piece_idx, assignment.deadline);
-            applied += 1;
         }
+        let applied = assignments.len();
 
         if applied > 0 {
             tracing::info!(
@@ -401,13 +390,15 @@ impl LibtorrentFileStream {
             first_byte_sent: self.first_read_logged,
         });
 
+        self.handle.set_piece_priorities(
+            decision
+                .assignments
+                .iter()
+                .map(|assignment| (assignment.piece_idx, assignment.piece_priority)),
+        );
         for assignment in &decision.assignments {
-            if !self.handle.have_piece(assignment.piece_idx) {
-                self.handle
-                    .set_piece_priority(assignment.piece_idx, assignment.piece_priority);
-                self.handle
-                    .set_piece_deadline(assignment.piece_idx, assignment.deadline);
-            }
+            self.handle
+                .set_piece_deadline(assignment.piece_idx, assignment.deadline);
         }
 
         tracing::debug!(

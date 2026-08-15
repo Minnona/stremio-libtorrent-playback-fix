@@ -761,7 +761,9 @@ impl LibtorrentPlaybackCoordinator {
         let handle = session
             .find_torrent(info_hash)
             .map_err(|error| anyhow!("Torrent not found: {error}"))?;
-        let complete = (file.first_piece..=file.last_piece).all(|piece| handle.have_piece(piece));
+        let presence = handle.piece_presence(file.first_piece, file.last_piece);
+        let expected = usize::try_from(file.last_piece - file.first_piece + 1).unwrap_or(0);
+        let complete = presence.len() == expected && presence.iter().all(|present| *present != 0);
         if let Some(cached) = layout.completion.write().get_mut(file_idx) {
             *cached = Some(complete);
         }
@@ -1107,14 +1109,20 @@ impl LibtorrentPlaybackCoordinator {
             consecutive_waits: 0,
             first_byte_sent: false,
         });
-        for assignment in decision.assignments {
-            if assignment.piece_idx >= file.first_piece
-                && assignment.piece_idx <= file.last_piece
-                && !handle.have_piece(assignment.piece_idx)
-            {
-                handle.set_piece_priority(assignment.piece_idx, assignment.piece_priority);
-                handle.set_piece_deadline(assignment.piece_idx, assignment.deadline);
-            }
+        let assignments = decision
+            .assignments
+            .into_iter()
+            .filter(|assignment| {
+                assignment.piece_idx >= file.first_piece && assignment.piece_idx <= file.last_piece
+            })
+            .collect::<Vec<_>>();
+        handle.set_piece_priorities(
+            assignments
+                .iter()
+                .map(|assignment| (assignment.piece_idx, assignment.piece_priority)),
+        );
+        for assignment in assignments {
+            handle.set_piece_deadline(assignment.piece_idx, assignment.deadline);
         }
         tracing::info!(
             info_hash = %info_hash,

@@ -18,6 +18,7 @@ namespace libtorrent_wrapper {
 // ============================================================================
 struct SessionSettings;
 struct AddTorrentParams;
+struct PiecePriority;
 struct TorrentStatus;
 struct FileInfo;
 struct PeerInfo;
@@ -155,9 +156,13 @@ void handle_move_storage(TorrentHandle &handle, rust::Str new_path);
 int32_t handle_num_pieces(TorrentHandle const &handle);
 int32_t handle_piece_length(TorrentHandle const &handle);
 bool handle_have_piece(TorrentHandle const &handle, int32_t piece);
+rust::Vec<uint8_t> handle_get_piece_presence(TorrentHandle const &handle,
+                                             int32_t first, int32_t last);
 rust::Vec<int32_t> handle_get_piece_availability(TorrentHandle const &handle);
 void handle_set_piece_priority(TorrentHandle &handle, int32_t piece,
                                int32_t priority);
+void handle_set_piece_priorities(
+    TorrentHandle &handle, rust::Slice<const PiecePriority> priorities);
 rust::Vec<int32_t> handle_get_piece_priorities(TorrentHandle const &handle);
 void handle_read_piece(TorrentHandle &handle, int32_t piece);
 

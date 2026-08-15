@@ -24,6 +24,7 @@
 #include <libtorrent/version.hpp>
 #include <libtorrent/write_resume_data.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <iterator>
@@ -165,6 +166,59 @@ static lt::session_params make_session_params(lt::settings_pack pack,
                             session_plugins(settings.enable_pex));
 }
 
+static lt::status_flags_t playback_status_flags() {
+  // The remaining status fields are cheap. In particular, omit piece maps,
+  // verified-piece maps, distributed-copy calculation and torrent metadata.
+  return lt::torrent_handle::query_name |
+         lt::torrent_handle::query_save_path |
+         lt::torrent_handle::query_last_seen_complete;
+}
+
+static void apply_streaming_performance_settings(lt::settings_pack &pack) {
+  // Keep upload buffers large enough to maintain reciprocity without forcing
+  // OS socket-buffer sizes and defeating TCP auto-tuning.
+  pack.set_int(lt::settings_pack::send_buffer_watermark, 512 * 1024);
+  pack.set_int(lt::settings_pack::send_buffer_watermark_factor, 150);
+  pack.set_int(lt::settings_pack::send_buffer_low_watermark, 10 * 1024);
+
+  pack.set_int(lt::settings_pack::choking_algorithm, 0);
+  pack.set_int(lt::settings_pack::seed_choking_algorithm, 2);
+
+  // Favor fast swarm acquisition while leaving enough time for useful peers
+  // on higher-latency paths to complete their TCP handshake.
+  pack.set_int(lt::settings_pack::request_timeout, 10);
+  pack.set_int(lt::settings_pack::peer_timeout, 60);
+  pack.set_int(lt::settings_pack::min_reconnect_time, 1);
+  pack.set_int(lt::settings_pack::max_failcount, 3);
+  pack.set_int(lt::settings_pack::connection_speed, 200);
+  pack.set_int(lt::settings_pack::peer_connect_timeout, 7);
+  pack.set_int(lt::settings_pack::torrent_connect_boost, 255);
+
+  pack.set_str(lt::settings_pack::dht_bootstrap_nodes,
+               "router.bittorrent.com:6881,"
+               "router.utorrent.com:6881,"
+               "dht.transmissionbt.com:6881,"
+               "dht.libtorrent.org:25401,"
+               "router.bitcomet.com:6881");
+
+  // Deadline pieces drive playback. Strict end-game avoids waste before the
+  // true end game; libtorrent's time-critical picker handles adaptive duplicate
+  // requests for stalled deadline blocks.
+  pack.set_bool(lt::settings_pack::strict_end_game_mode, true);
+  pack.set_bool(lt::settings_pack::prioritize_partial_pieces, true);
+  pack.set_bool(lt::settings_pack::smooth_connects, false);
+  pack.set_int(lt::settings_pack::piece_timeout, 5);
+
+  // 2.1 raised these defaults. The larger outbound ceiling is also used by
+  // libtorrent's high-performance preset and avoids clipping high-BDP peers;
+  // the inbound value preserves enough upload pipeline for reciprocity.
+  pack.set_int(lt::settings_pack::max_out_request_queue, 1500);
+  pack.set_int(lt::settings_pack::max_allowed_in_request_queue, 2000);
+  pack.set_int(lt::settings_pack::request_queue_time, 3);
+  pack.set_int(lt::settings_pack::unchoke_slots_limit, 20);
+  pack.set_int(lt::settings_pack::alert_queue_size, 10000);
+}
+
 static TorrentStatus make_torrent_status(const lt::torrent_status &ts) {
   TorrentStatus status;
   status.info_hash = sha1_to_hex(ts.info_hashes.get_best());
@@ -257,73 +311,17 @@ std::unique_ptr<Session> create_session(SessionSettings const &settings) {
   if (settings.active_limit > 0)
     pack.set_int(lt::settings_pack::active_limit, settings.active_limit);
 
-  // =========================================================================
-  // PERFORMANCE OPTIMIZATIONS FOR WINDOWS
-  // =========================================================================
+  apply_streaming_performance_settings(pack);
 
-  // Socket buffer sizes - larger buffers help with high latency connections
-  pack.set_int(lt::settings_pack::send_buffer_watermark, 512 * 1024); // 512KB
-  pack.set_int(lt::settings_pack::send_buffer_watermark_factor, 150);
-  pack.set_int(lt::settings_pack::send_buffer_low_watermark, 10 * 1024); // 10KB
-
-  // Choking algorithm optimized for downloading
-  // 0 = fixed_slots_choker, 2 = fastest_upload
-  pack.set_int(lt::settings_pack::choking_algorithm, 0);
-  pack.set_int(lt::settings_pack::seed_choking_algorithm, 2);
-
-  // Connection tuning
-  pack.set_int(lt::settings_pack::request_timeout, 10);
-  pack.set_int(lt::settings_pack::peer_timeout, 60);
-  pack.set_int(lt::settings_pack::min_reconnect_time, 1);
-  pack.set_int(lt::settings_pack::max_failcount, 3);
-  pack.set_int(lt::settings_pack::connection_speed,
-               200); // Connections per second (was 30)
-
-  // DHT Bootstrap nodes - helpful for fast initial startup
-  pack.set_str(lt::settings_pack::dht_bootstrap_nodes,
-               "router.bittorrent.com:6881,"
-               "router.utorrent.com:6881,"
-               "dht.transmissionbt.com:6881,"
-               "dht.libtorrent.org:25401,"
-               "router.bitcomet.com:6881");
-
-  // Piece selection for streaming
-  // CRITICAL: Enable strict endgame mode for deadline pieces
-  // This allows requesting the same blocks from MULTIPLE peers simultaneously
-  // The fastest peer wins, dramatically speeding up critical piece downloads
-  pack.set_bool(lt::settings_pack::strict_end_game_mode, true);
-  pack.set_bool(lt::settings_pack::prioritize_partial_pieces, true);
-
-  // Faster connections for streaming
-  pack.set_bool(lt::settings_pack::smooth_connects,
-                false); // Don't spread out connection attempts
-  pack.set_int(lt::settings_pack::piece_timeout,
-               5); // Time before considering piece stalled (was 20)
-  pack.set_int(lt::settings_pack::peer_connect_timeout,
-               3); // Faster peer connection timeout (was 15)
-  pack.set_int(lt::settings_pack::request_timeout,
-               10); // Faster request timeout (was 60)
-
-  // Increase request queue depth for more aggressive downloading
-  pack.set_int(lt::settings_pack::max_out_request_queue, 500); // Default 200
-  pack.set_int(lt::settings_pack::max_allowed_in_request_queue,
-               250); // Default 100
-  pack.set_int(lt::settings_pack::request_queue_time,
-               3); // Default 5, reduce for faster requests
-
-  // Disk write pipeline. At 12+ MB/s the default ~1 MiB disk write queue is
-  // under 100 ms of buffering, so write back-pressure can periodically stall
-  // the download. A larger queue plus more I/O threads keeps the network side
-  // fed while pieces are flushed to disk in parallel (disk-backed download
-  // mode).
+  // Stay above 2.1.1's 100 MiB default so bursty disk writes do not throttle
+  // fast peers. Extent affinity improves locality for torrents with small
+  // pieces, and no-atime removes metadata writes on platforms that support it.
   pack.set_int(lt::settings_pack::max_queued_disk_bytes,
-               64 * 1024 * 1024);                   // 64 MiB (default ~1 MiB)
-  pack.set_int(lt::settings_pack::aio_threads, 16); // parallel disk I/O
-  pack.set_int(lt::settings_pack::whole_pieces_threshold,
-               30); // request whole pieces from peers that can finish them fast
-
-  // Outgoing connections
-  pack.set_int(lt::settings_pack::unchoke_slots_limit, 20); // (was 8)
+               128 * 1024 * 1024);
+  pack.set_int(lt::settings_pack::aio_threads, 16);
+  pack.set_int(lt::settings_pack::whole_pieces_threshold, 30);
+  pack.set_bool(lt::settings_pack::piece_extent_affinity, true);
+  pack.set_bool(lt::settings_pack::no_atime_storage, true);
 
   // Playback needs storage/control alerts plus piece_finished_alert, whose
   // category is piece_progress in libtorrent 2.x. Peer alerts are intentionally
@@ -380,34 +378,7 @@ create_session_memory_only(SessionSettings const &settings) {
   if (settings.active_limit > 0)
     pack.set_int(lt::settings_pack::active_limit, settings.active_limit);
 
-  // Same performance settings as regular session
-  pack.set_int(lt::settings_pack::send_buffer_watermark, 512 * 1024);
-  pack.set_int(lt::settings_pack::send_buffer_watermark_factor, 150);
-  pack.set_int(lt::settings_pack::send_buffer_low_watermark, 10 * 1024);
-  pack.set_int(lt::settings_pack::choking_algorithm, 0);
-  pack.set_int(lt::settings_pack::seed_choking_algorithm, 2);
-  pack.set_int(lt::settings_pack::request_timeout, 10);
-  pack.set_int(lt::settings_pack::peer_timeout, 60);
-  pack.set_int(lt::settings_pack::min_reconnect_time, 1);
-  pack.set_int(lt::settings_pack::max_failcount, 3);
-  pack.set_int(lt::settings_pack::connection_speed, 200);
-
-  pack.set_str(lt::settings_pack::dht_bootstrap_nodes,
-               "router.bittorrent.com:6881,"
-               "router.utorrent.com:6881,"
-               "dht.transmissionbt.com:6881,"
-               "dht.libtorrent.org:25401,"
-               "router.bitcomet.com:6881");
-
-  pack.set_bool(lt::settings_pack::strict_end_game_mode, true);
-  pack.set_bool(lt::settings_pack::prioritize_partial_pieces, true);
-  pack.set_bool(lt::settings_pack::smooth_connects, false);
-  pack.set_int(lt::settings_pack::piece_timeout, 5);
-  pack.set_int(lt::settings_pack::peer_connect_timeout, 3);
-  pack.set_int(lt::settings_pack::max_out_request_queue, 500);
-  pack.set_int(lt::settings_pack::max_allowed_in_request_queue, 250);
-  pack.set_int(lt::settings_pack::request_queue_time, 3);
-  pack.set_int(lt::settings_pack::unchoke_slots_limit, 20);
+  apply_streaming_performance_settings(pack);
 
   pack.set_int(lt::settings_pack::alert_mask,
                lt::alert_category::error | lt::alert_category::status |
@@ -597,7 +568,7 @@ rust::Vec<TorrentStatus> session_get_torrents(Session const &session) {
   for (const auto &h : session.session.get_torrents()) {
     if (!h.is_valid())
       continue;
-    result.push_back(make_torrent_status(h.status()));
+    result.push_back(make_torrent_status(h.status(playback_status_flags())));
   }
   return result;
 }
@@ -617,7 +588,7 @@ TorrentStatus session_get_torrent_status(Session const &session,
   lt::torrent_handle h = session.session.find_torrent(hash);
   if (!h.is_valid())
     throw std::runtime_error("Torrent not found");
-  return make_torrent_status(h.status());
+  return make_torrent_status(h.status(playback_status_flags()));
 }
 
 // ============================================================================
@@ -638,7 +609,7 @@ SessionStats session_get_stats(Session const &session) {
   for (const auto &h : handles) {
     if (!h.is_valid())
       continue;
-    auto ts = h.status();
+    auto ts = h.status(lt::status_flags_t{});
     stats.download_rate += ts.download_rate;
     stats.upload_rate += ts.upload_rate;
     stats.total_download += ts.all_time_download;
@@ -812,11 +783,12 @@ rust::String handle_get_info_hash_v2(TorrentHandle const &handle) {
 }
 
 rust::String handle_get_name(TorrentHandle const &handle) {
-  return rust::String(handle.handle.status().name);
+  return rust::String(
+      handle.handle.status(lt::torrent_handle::query_name).name);
 }
 
 TorrentStatus handle_get_status(TorrentHandle const &handle) {
-  return make_torrent_status(handle.handle.status());
+  return make_torrent_status(handle.handle.status(playback_status_flags()));
 }
 
 // ============================================================================
@@ -939,7 +911,8 @@ rust::Vec<FileInfo> handle_get_files(TorrentHandle const &handle) {
   if (!ti)
     return result;
 
-  auto ts = handle.handle.status();
+  auto ts =
+      handle.handle.status(lt::torrent_handle::query_save_path);
   const lt::file_storage &files = ti->layout();
   auto file_progress = handle.handle.file_progress();
   auto priorities = handle.handle.get_file_priorities();
@@ -1026,6 +999,26 @@ bool handle_have_piece(TorrentHandle const &handle, int32_t piece) {
   return handle.handle.have_piece(lt::piece_index_t(piece));
 }
 
+rust::Vec<uint8_t> handle_get_piece_presence(TorrentHandle const &handle,
+                                             int32_t first, int32_t last) {
+  rust::Vec<uint8_t> result;
+  auto const ti = handle.handle.torrent_file();
+  if (!ti || first < 0 || last < first || first >= ti->num_pieces())
+    return result;
+
+  last = std::min(last, ti->num_pieces() - 1);
+  auto const status =
+      handle.handle.status(lt::torrent_handle::query_pieces);
+  result.reserve(static_cast<std::size_t>(last - first + 1));
+  for (int32_t piece = first; piece <= last; ++piece) {
+    bool const present = status.is_seeding ||
+                         (!status.pieces.empty() &&
+                          status.pieces[lt::piece_index_t(piece)]);
+    result.push_back(present ? uint8_t{1} : uint8_t{0});
+  }
+  return result;
+}
+
 rust::Vec<int32_t> handle_get_piece_availability(TorrentHandle const &handle) {
   rust::Vec<int32_t> result;
   std::vector<int> avail;
@@ -1040,6 +1033,19 @@ void handle_set_piece_priority(TorrentHandle &handle, int32_t piece,
   handle.handle.piece_priority(
       lt::piece_index_t(piece),
       lt::download_priority_t(static_cast<uint8_t>(priority)));
+}
+
+void handle_set_piece_priorities(
+    TorrentHandle &handle, rust::Slice<const PiecePriority> priorities) {
+  std::vector<std::pair<lt::piece_index_t, lt::download_priority_t>> updates;
+  updates.reserve(priorities.size());
+  for (auto const &priority : priorities) {
+    updates.emplace_back(
+        lt::piece_index_t(priority.piece),
+        lt::download_priority_t(static_cast<uint8_t>(priority.priority)));
+  }
+  if (!updates.empty())
+    handle.handle.prioritize_pieces(updates);
 }
 
 rust::Vec<int32_t> handle_get_piece_priorities(TorrentHandle const &handle) {

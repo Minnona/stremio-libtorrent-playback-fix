@@ -116,7 +116,8 @@ impl LibtorrentAlertHub {
         };
 
         if submit_native_request {
-            if handle.have_piece(piece) {
+            let already_verified = handle.have_piece(piece);
+            if already_verified {
                 if let Err(error) = handle.read_piece(piece)
                     && let Some(sender) = self.piece_senders.lock().remove(&key)
                 {
@@ -129,7 +130,7 @@ impl LibtorrentAlertHub {
             tracing::debug!(
                 info_hash = %key.0,
                 piece,
-                already_verified = handle.have_piece(piece),
+                already_verified,
                 "submitted coalesced libtorrent piece-byte request"
             );
         }

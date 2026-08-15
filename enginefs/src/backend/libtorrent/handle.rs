@@ -112,6 +112,11 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
 
         // Populate files from the handle
         let files = handle.files();
+        let piece_presence = if piece_length > 0 {
+            handle.piece_presence(0, handle.num_pieces().saturating_sub(1))
+        } else {
+            Vec::new()
+        };
         let mut current_offset = 0u64;
 
         stats.files = files
@@ -126,12 +131,15 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                     f.downloaded as u64
                 } else if piece_length > 0 {
                     // Count pieces we have in this file's range
-                    let mut piece_bytes = 0u64;
-                    for piece in f.first_piece..=f.last_piece {
-                        if handle.have_piece(piece) {
-                            piece_bytes += piece_length;
-                        }
-                    }
+                    let piece_bytes = (f.first_piece..=f.last_piece)
+                        .filter(|piece| {
+                            usize::try_from(*piece)
+                                .ok()
+                                .and_then(|index| piece_presence.get(index))
+                                .is_some_and(|present| *present != 0)
+                        })
+                        .count() as u64
+                        * piece_length;
                     // Cap at file size (last piece may be partial)
                     piece_bytes.min(f.size as u64)
                 } else {
@@ -585,11 +593,14 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                 consecutive_waits: 0,
                 first_byte_sent: false,
             });
+            handle.set_piece_priorities(
+                decision
+                    .assignments
+                    .iter()
+                    .map(|assignment| (assignment.piece_idx, assignment.piece_priority)),
+            );
             for assignment in &decision.assignments {
-                if !handle.have_piece(assignment.piece_idx) {
-                    handle.set_piece_priority(assignment.piece_idx, assignment.piece_priority);
-                    handle.set_piece_deadline(assignment.piece_idx, assignment.deadline);
-                }
+                handle.set_piece_deadline(assignment.piece_idx, assignment.deadline);
             }
             tracing::info!(
                 intent = ?intent,
@@ -652,18 +663,18 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                 // Count contiguous ready pieces from the target. Disk-backed
                 // storage only needs `have_piece`; memory storage also needs the
                 // piece copied into the read cache (serviced after unlock).
+                let cluster_end = last_piece.min(piece + target_pieces as i32 - 1);
+                let cluster_presence = handle.piece_presence(piece, cluster_end);
                 let mut ready = 0u32;
-                for ready_piece in piece..=last_piece.min(piece + target_pieces as i32 - 1) {
-                    if matches!(self.storage_mode, LibtorrentStorageMode::DiskBacked) {
-                        if handle.have_piece(ready_piece) {
-                            ready += 1;
-                        } else {
-                            break;
-                        }
-                    } else if handle.have_piece(ready_piece) {
-                        memory_pieces_to_cache.push(ready_piece);
-                    } else {
+                for (offset, present) in cluster_presence.iter().copied().enumerate() {
+                    if present == 0 {
                         break;
+                    }
+                    let ready_piece = piece.saturating_add(offset as i32);
+                    if matches!(self.storage_mode, LibtorrentStorageMode::DiskBacked) {
+                        ready += 1;
+                    } else {
+                        memory_pieces_to_cache.push(ready_piece);
                     }
                 }
 
@@ -675,14 +686,19 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                         >= std::time::Duration::from_millis(DISK_READINESS_REASSERT_MS)
                 {
                     last_cluster_reassert = std::time::Instant::now();
-                    let cluster_end =
-                        last_piece.min(piece + target_pieces.saturating_sub(1) as i32);
-                    for p in piece..=cluster_end {
-                        if !handle.have_piece(p) {
-                            let distance = p.saturating_sub(piece);
-                            handle.set_piece_priority(p, 7);
-                            handle.set_piece_deadline(p, distance * 10);
-                        }
+                    let assignments = cluster_presence
+                        .iter()
+                        .copied()
+                        .enumerate()
+                        .filter(|(_, present)| *present == 0)
+                        .map(|(offset, _)| {
+                            let target = piece.saturating_add(offset as i32);
+                            (target, target.saturating_sub(piece) * 10)
+                        })
+                        .collect::<Vec<_>>();
+                    handle.set_piece_priorities(assignments.iter().map(|(piece, _)| (*piece, 7)));
+                    for (piece, deadline) in assignments {
+                        handle.set_piece_deadline(piece, deadline);
                     }
                 }
                 let rate_bucket = rate / (64 * 1024);
@@ -706,22 +722,27 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                         consecutive_waits: 1,
                         first_byte_sent: false,
                     });
+                    handle.set_piece_priorities(
+                        decision
+                            .assignments
+                            .iter()
+                            .map(|assignment| (assignment.piece_idx, assignment.piece_priority)),
+                    );
                     for assignment in &decision.assignments {
-                        if !handle.have_piece(assignment.piece_idx) {
-                            handle.set_piece_priority(
-                                assignment.piece_idx,
-                                assignment.piece_priority,
-                            );
-                            handle.set_piece_deadline(assignment.piece_idx, assignment.deadline);
-                        }
+                        handle.set_piece_deadline(assignment.piece_idx, assignment.deadline);
                     }
                 }
 
                 if last_readiness_log.elapsed() >= std::time::Duration::from_secs(5) {
                     last_readiness_log = std::time::Instant::now();
-                    let verified_piece_count = (first_piece..=last_piece)
-                        .filter(|p| handle.have_piece(*p))
-                        .count();
+                    let verified_bytes_estimate = u64::try_from(status.total_wanted_done)
+                        .unwrap_or(0)
+                        .min(file_size);
+                    let verified_piece_count = if piece_length == 0 {
+                        0
+                    } else {
+                        verified_bytes_estimate.div_ceil(piece_length) as usize
+                    };
                     let request_offset_percent = if file_size > 0 {
                         (offset.min(file_size) as f64 / file_size as f64) * 100.0
                     } else {

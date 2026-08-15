@@ -108,6 +108,13 @@ mod ffi {
         info_hash_v2: String,
     }
 
+    /// Sparse piece-priority update submitted as one libtorrent operation.
+    #[derive(Debug, Clone, Copy)]
+    struct PiecePriority {
+        piece: i32,
+        priority: i32,
+    }
+
     /// Torrent status information
     #[derive(Debug, Clone)]
     struct TorrentStatus {
@@ -489,8 +496,13 @@ mod ffi {
         fn handle_num_pieces(handle: &TorrentHandle) -> i32;
         fn handle_piece_length(handle: &TorrentHandle) -> i32;
         fn handle_have_piece(handle: &TorrentHandle, piece: i32) -> bool;
+        fn handle_get_piece_presence(handle: &TorrentHandle, first: i32, last: i32) -> Vec<u8>;
         fn handle_get_piece_availability(handle: &TorrentHandle) -> Vec<i32>;
         fn handle_set_piece_priority(handle: Pin<&mut TorrentHandle>, piece: i32, priority: i32);
+        fn handle_set_piece_priorities(
+            handle: Pin<&mut TorrentHandle>,
+            priorities: &[PiecePriority],
+        );
         fn handle_get_piece_priorities(handle: &TorrentHandle) -> Vec<i32>;
         fn handle_read_piece(handle: Pin<&mut TorrentHandle>, piece: i32) -> Result<()>; // Async via alert
 
@@ -784,6 +796,17 @@ impl LibtorrentHandle {
         ffi::handle_set_piece_priority(self.inner.pin_mut(), piece, priority)
     }
 
+    /// Update selected piece priorities with a single native libtorrent call.
+    pub fn set_piece_priorities(&mut self, priorities: impl IntoIterator<Item = (i32, i32)>) {
+        let priorities = priorities
+            .into_iter()
+            .map(|(piece, priority)| ffi::PiecePriority { piece, priority })
+            .collect::<Vec<_>>();
+        if !priorities.is_empty() {
+            ffi::handle_set_piece_priorities(self.inner.pin_mut(), &priorities);
+        }
+    }
+
     /// Current availability count for each piece.
     pub fn piece_availability(&self) -> Vec<i32> {
         ffi::handle_get_piece_availability(&self.inner)
@@ -797,6 +820,14 @@ impl LibtorrentHandle {
     /// Check if piece is downloaded
     pub fn have_piece(&self, piece: i32) -> bool {
         ffi::handle_have_piece(&self.inner, piece)
+    }
+
+    /// Return one byte per piece in the inclusive range (1 = present).
+    ///
+    /// Unlike repeated `have_piece` calls, this takes one native status
+    /// snapshot and therefore blocks libtorrent's internal thread only once.
+    pub fn piece_presence(&self, first: i32, last: i32) -> Vec<u8> {
+        ffi::handle_get_piece_presence(&self.inner, first, last)
     }
 
     /// Number of pieces
