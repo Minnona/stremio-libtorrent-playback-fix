@@ -329,7 +329,8 @@ std::unique_ptr<Session> create_session(SessionSettings const &settings) {
   pack.set_int(lt::settings_pack::alert_mask,
                lt::alert_category::error | lt::alert_category::status |
                    lt::alert_category::storage |
-                   lt::alert_category::piece_progress);
+                   lt::alert_category::piece_progress |
+                   lt::alert_category::performance_warning);
 
   apply_proxy_settings(pack, settings);
 
@@ -383,7 +384,8 @@ create_session_memory_only(SessionSettings const &settings) {
   pack.set_int(lt::settings_pack::alert_mask,
                lt::alert_category::error | lt::alert_category::status |
                    lt::alert_category::storage |
-                   lt::alert_category::piece_progress);
+                   lt::alert_category::piece_progress |
+                   lt::alert_category::performance_warning);
 
   apply_proxy_settings(pack, settings);
 
@@ -1240,6 +1242,10 @@ int32_t get_torrent_resumed_alert_type() {
 
 int32_t get_file_error_alert_type() {
   return lt::file_error_alert::alert_type;
+}
+
+int32_t get_performance_alert_type() {
+  return lt::performance_alert::alert_type;
 }
 
 } // namespace libtorrent_wrapper

@@ -4,6 +4,9 @@ fn starts_and_stops_embedded_server() -> anyhow::Result<()> {
     let cache_dir = tempfile::tempdir()?;
 
     let handle = stream_server::start(stream_server::ServerConfig {
+        // Tests must not compete with a running desktop instance (or another
+        // test process) for the production port.
+        http_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         config_dir: Some(config_dir.path().join("config")),
         cache_dir: Some(cache_dir.path().join("cache")),
         ..stream_server::ServerConfig::default()

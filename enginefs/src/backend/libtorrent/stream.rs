@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::backend::priorities::{
     BLOCKED_REPLAN_INTERVAL_MS, EngineCacheConfig, MemoryPressure, PlaybackIntent,
-    PlaybackPriorityPolicy, PriorityBand, PriorityContext,
+    PlaybackPriorityPolicy, PriorityAssignment, PriorityContext,
 };
 
 /// Type of seek operation - determines priority behavior
@@ -38,7 +38,6 @@ pub(crate) struct LibtorrentFileStream {
     pub(crate) is_complete: bool,
     pub(crate) last_priorities_piece: i32,
     pub(crate) cache_config: EngineCacheConfig,
-    pub(crate) priority: u8,
     pub(crate) bitrate: Option<u64>,
     pub(crate) download_speed_ema: f64,
     pub(crate) stream_id: usize,
@@ -101,6 +100,50 @@ impl LibtorrentFileStream {
         }
     }
 
+    fn priority_replan_intent(&self) -> PlaybackIntent {
+        match self.playback_intent {
+            PlaybackIntent::ContainerMetadata
+            | PlaybackIntent::InternalProbe
+            | PlaybackIntent::Background => self.playback_intent,
+            intent => intent.seek_for_same_family(),
+        }
+    }
+
+    fn replace_priority_window<'a>(
+        &self,
+        assignments: impl IntoIterator<Item = &'a PriorityAssignment>,
+    ) -> usize {
+        let non_time_critical = self.playback_permit.is_subordinate()
+            || matches!(
+                self.playback_intent,
+                PlaybackIntent::InternalProbe | PlaybackIntent::Background
+            );
+        let jitter = (self.stream_id % 10) as i32 * 5;
+        let assignments = assignments
+            .into_iter()
+            .filter(|assignment| {
+                assignment.piece_idx >= self.first_piece && assignment.piece_idx <= self.last_piece
+            })
+            .map(|assignment| {
+                let deadline_ms = if non_time_critical {
+                    None
+                } else if assignment.deadline == 0 || assignment.deadline >= 100_000 {
+                    Some(assignment.deadline)
+                } else {
+                    Some(assignment.deadline.saturating_add(jitter))
+                };
+                super::playback::LibtorrentPiecePriority {
+                    piece: assignment.piece_idx,
+                    priority: assignment.piece_priority,
+                    deadline_ms,
+                }
+            })
+            .collect::<Vec<_>>();
+        let applied = assignments.len();
+        self.playback_permit.replace_priority_window(assignments);
+        applied
+    }
+
     fn set_priorities(&mut self, pos: u64) {
         // Skip if already complete
         if self.is_complete {
@@ -116,14 +159,6 @@ impl LibtorrentFileStream {
         // So (file_offset + pos) is the global byte offset in the torrent.
         let current_piece = ((self.file_offset + pos) / self.piece_length) as i32;
 
-        // Internal readers are diagnostic/probe readers. They must not rewrite
-        // playback deadlines while the real direct stream is active.
-        if self.priority == 255 {
-            self.seek_type = SeekType::Sequential;
-            self.last_priorities_piece = current_piece;
-            return;
-        }
-
         // Efficient cache check: if we are on the same piece, do nothing
         if current_piece == self.last_priorities_piece {
             return;
@@ -134,7 +169,7 @@ impl LibtorrentFileStream {
         // DETERMINISTIC SEEK HANDLING: Use tracked SeekType instead of piece-jump heuristics
         match priority_seek_type {
             SeekType::Sequential | SeekType::InitialPlayback => {
-                // Sequential read or initial playback - just extend window, no cleanup
+                // Sequential read or initial playback advances this reader's window.
                 tracing::trace!(
                     "set_priorities: {:?} at piece {} - extending window",
                     priority_seek_type,
@@ -142,13 +177,12 @@ impl LibtorrentFileStream {
                 );
             }
             SeekType::ContainerMetadata => {
-                // Container metadata read - ADD priorities, but preserve head pieces
-                // This is critical: don't wipe out piece 0-7 priorities when reading moov/Cues
+                // Other readers retain their own head leases while this reader
+                // moves to the moov/Cues region.
                 tracing::debug!(
                     "set_priorities: ContainerMetadata at piece {} - preserving head priorities",
                     current_piece
                 );
-                // Don't clear deadlines - this is the key fix for container metadata!
             }
             SeekType::UserScrub => {
                 tracing::debug!(
@@ -167,7 +201,7 @@ impl LibtorrentFileStream {
         // Calculate dynamic EMA for download speed to avoid priority oscillations
         let status = self.handle.status();
         let _total_pieces = status.num_pieces; // Unused, kept for potential future use
-        let current_speed = status.download_rate as f64;
+        let current_speed = status.download_rate.max(0) as f64;
 
         // Alpha of 0.2 means 20% weight to new sample, ~5 samples to converge
         if self.download_speed_ema == 0.0 {
@@ -178,7 +212,7 @@ impl LibtorrentFileStream {
 
         let intent = match priority_seek_type {
             SeekType::ContainerMetadata => PlaybackIntent::ContainerMetadata,
-            SeekType::UserScrub => self.playback_intent.seek_for_same_family(),
+            SeekType::UserScrub => self.priority_replan_intent(),
             SeekType::InitialPlayback | SeekType::Sequential => {
                 if self.first_read_logged {
                     self.playback_intent.sequential_after_first_byte()
@@ -225,38 +259,16 @@ impl LibtorrentFileStream {
             "priority_decision stream_replan"
         );
 
-        // Apply fair-sharing jitter (Shuffle Mirroring)
-        // Adding a small unique offset to each stream's deadlines ensures that
-        // when multiple streams are active, their "earliest" pieces are interleaved.
-        let jitter = (self.stream_id % 10) as i32 * 5; // Up to 50ms jitter
-
-        let assignments = decision
-            .assignments
-            .into_iter()
-            .filter(|item| item.piece_idx >= self.first_piece && item.piece_idx <= self.last_piece)
-            .collect::<Vec<_>>();
-        self.handle.set_piece_priorities(
-            assignments
-                .iter()
-                .map(|item| (item.piece_idx, item.piece_priority)),
-        );
-        for item in assignments {
-            let shared_deadline = if item.deadline == 0 {
-                0
-            } else if item.deadline >= 100000 {
-                // Don't jitter very long background deadlines
-                item.deadline
-            } else {
-                item.deadline + jitter
-            };
-            self.handle
-                .set_piece_deadline(item.piece_idx, shared_deadline);
-        }
+        self.replace_priority_window(&decision.assignments);
     }
 
     fn reassert_serving_window(&mut self, served_piece: i32) {
         if self.is_complete
-            || self.priority == 255
+            || self.playback_permit.is_subordinate()
+            || matches!(
+                self.playback_intent,
+                PlaybackIntent::InternalProbe | PlaybackIntent::Background
+            )
             || served_piece < self.first_piece
             || served_piece > self.last_piece
             || self.last_served_replan_piece == served_piece
@@ -288,7 +300,7 @@ impl LibtorrentFileStream {
             MemoryPressure::Normal
         };
 
-        let intent = self.playback_intent.seek_for_same_family();
+        let intent = self.priority_replan_intent();
         let decision = PlaybackPriorityPolicy::decide(PriorityContext {
             intent,
             current_piece: next_piece,
@@ -297,7 +309,7 @@ impl LibtorrentFileStream {
             piece_length: self.piece_length,
             file_size: self.file_size,
             bitrate_bytes_per_sec: self.bitrate,
-            download_rate_bytes_per_sec: status.download_rate as u64,
+            download_rate_bytes_per_sec: status.download_rate.max(0) as u64,
             peers: status.num_peers as u64,
             cache_size_bytes: self.cache_config.size,
             memory_pressure,
@@ -305,24 +317,7 @@ impl LibtorrentFileStream {
             first_byte_sent: self.first_read_logged,
         });
 
-        let assignments = decision
-            .assignments
-            .iter()
-            .take_while(|assignment| assignment.band == PriorityBand::Immediate)
-            .filter(|assignment| {
-                assignment.piece_idx >= self.first_piece && assignment.piece_idx <= self.last_piece
-            })
-            .collect::<Vec<_>>();
-        self.handle.set_piece_priorities(
-            assignments
-                .iter()
-                .map(|assignment| (assignment.piece_idx, 7)),
-        );
-        for assignment in &assignments {
-            self.handle
-                .set_piece_deadline(assignment.piece_idx, assignment.deadline);
-        }
-        let applied = assignments.len();
+        let applied = self.replace_priority_window(&decision.assignments);
 
         if applied > 0 {
             tracing::info!(
@@ -373,7 +368,7 @@ impl LibtorrentFileStream {
             MemoryPressure::Normal
         };
 
-        let intent = self.playback_intent.seek_for_same_family();
+        let intent = self.priority_replan_intent();
         let decision = PlaybackPriorityPolicy::decide(PriorityContext {
             intent,
             current_piece: piece,
@@ -382,7 +377,7 @@ impl LibtorrentFileStream {
             piece_length: self.piece_length,
             file_size: self.file_size,
             bitrate_bytes_per_sec: self.bitrate,
-            download_rate_bytes_per_sec: status.download_rate as u64,
+            download_rate_bytes_per_sec: status.download_rate.max(0) as u64,
             peers: status.num_peers as u64,
             cache_size_bytes: self.cache_config.size,
             memory_pressure,
@@ -390,16 +385,7 @@ impl LibtorrentFileStream {
             first_byte_sent: self.first_read_logged,
         });
 
-        self.handle.set_piece_priorities(
-            decision
-                .assignments
-                .iter()
-                .map(|assignment| (assignment.piece_idx, assignment.piece_priority)),
-        );
-        for assignment in &decision.assignments {
-            self.handle
-                .set_piece_deadline(assignment.piece_idx, assignment.deadline);
-        }
+        self.replace_priority_window(&decision.assignments);
 
         tracing::debug!(
             intent = ?intent,

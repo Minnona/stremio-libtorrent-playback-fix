@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -25,6 +25,7 @@ const PAUSE_RETRY_DELAY: Duration = Duration::from_secs(5);
 const EMERGENCY_REANNOUNCE_DELAY: Duration = Duration::from_secs(2);
 const EMERGENCY_REANNOUNCE_COOLDOWN: Duration = Duration::from_secs(60);
 const METADATA_TIMEOUT: Duration = Duration::from_secs(30);
+const HLS_PRIORITY_STREAM_ID: usize = usize::MAX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LibtorrentNetworkPhase {
@@ -36,6 +37,7 @@ pub enum LibtorrentNetworkPhase {
 #[derive(Debug, Clone)]
 pub struct LibtorrentPlaybackStart {
     pub file_idx: usize,
+    pub stream_id: usize,
     pub start_offset: u64,
     pub priority: u8,
     pub intent: PlaybackIntent,
@@ -47,6 +49,7 @@ pub struct LibtorrentPlaybackPermit {
     pub info_hash: String,
     pub file_idx: usize,
     pub generation: u64,
+    stream_id: usize,
     pub cancellation: CancellationToken,
     command_tx: mpsc::UnboundedSender<PlaybackCommand>,
     foreground: bool,
@@ -62,6 +65,21 @@ impl LibtorrentPlaybackPermit {
     pub(crate) fn is_subordinate(&self) -> bool {
         self.subordinate
     }
+
+    pub(crate) fn replace_priority_window(&self, assignments: Vec<LibtorrentPiecePriority>) {
+        if self.released || self.cancellation.is_cancelled() {
+            return;
+        }
+        let _ = self
+            .command_tx
+            .send(PlaybackCommand::ReplacePriorityWindow {
+                info_hash: self.info_hash.clone(),
+                file_idx: self.file_idx,
+                generation: self.generation,
+                stream_id: self.stream_id,
+                assignments,
+            });
+    }
 }
 
 impl Drop for LibtorrentPlaybackPermit {
@@ -74,8 +92,106 @@ impl Drop for LibtorrentPlaybackPermit {
             info_hash: self.info_hash.clone(),
             file_idx: self.file_idx,
             generation: self.generation,
+            stream_id: self.stream_id,
             foreground: self.foreground,
         });
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LibtorrentPiecePriority {
+    pub(crate) piece: i32,
+    pub(crate) priority: i32,
+    pub(crate) deadline_ms: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PiecePriorityChange {
+    Apply(LibtorrentPiecePriority),
+    Reset(i32),
+}
+
+#[derive(Default)]
+struct ActivePriorityWindows {
+    streams: HashMap<usize, HashMap<i32, LibtorrentPiecePriority>>,
+    effective: HashMap<i32, LibtorrentPiecePriority>,
+}
+
+impl ActivePriorityWindows {
+    fn replace(
+        &mut self,
+        stream_id: usize,
+        assignments: Vec<LibtorrentPiecePriority>,
+    ) -> Vec<PiecePriorityChange> {
+        let replacement = assignments
+            .into_iter()
+            .filter(|assignment| assignment.piece >= 0)
+            .map(|assignment| (assignment.piece, assignment))
+            .collect::<HashMap<_, _>>();
+        let mut affected = replacement.keys().copied().collect::<HashSet<_>>();
+        if let Some(previous) = self.streams.insert(stream_id, replacement) {
+            affected.extend(previous.keys().copied());
+        }
+        self.reconcile(affected)
+    }
+
+    fn release(&mut self, stream_id: usize) -> Vec<PiecePriorityChange> {
+        let Some(previous) = self.streams.remove(&stream_id) else {
+            return Vec::new();
+        };
+        self.reconcile(previous.into_keys().collect())
+    }
+
+    fn clear_tracking(&mut self) {
+        self.streams.clear();
+        self.effective.clear();
+    }
+
+    fn mark_piece_verified(&mut self, piece: i32) {
+        for window in self.streams.values_mut() {
+            window.remove(&piece);
+        }
+        self.effective.remove(&piece);
+    }
+
+    fn reconcile(&mut self, affected: HashSet<i32>) -> Vec<PiecePriorityChange> {
+        let mut changes = Vec::with_capacity(affected.len());
+        for piece in affected {
+            let next = self.effective_for(piece);
+            if self.effective.get(&piece).copied() == next {
+                continue;
+            }
+            match next {
+                Some(next) => {
+                    self.effective.insert(piece, next);
+                    changes.push(PiecePriorityChange::Apply(next));
+                }
+                None => {
+                    self.effective.remove(&piece);
+                    changes.push(PiecePriorityChange::Reset(piece));
+                }
+            }
+        }
+        changes.sort_unstable_by_key(|change| match change {
+            PiecePriorityChange::Apply(assignment) => assignment.piece,
+            PiecePriorityChange::Reset(piece) => *piece,
+        });
+        changes
+    }
+
+    fn effective_for(&self, piece: i32) -> Option<LibtorrentPiecePriority> {
+        self.streams
+            .values()
+            .filter_map(|window| window.get(&piece).copied())
+            .reduce(|left, right| LibtorrentPiecePriority {
+                piece,
+                priority: left.priority.max(right.priority),
+                deadline_ms: match (left.deadline_ms, right.deadline_ms) {
+                    (Some(left), Some(right)) => Some(left.min(right)),
+                    (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+                    (None, None) => None,
+                },
+            })
     }
 }
 
@@ -131,6 +247,7 @@ struct TorrentPlaybackState {
     acknowledged_priorities: Option<Vec<i32>>,
     metadata_announced: bool,
     last_emergency_reannounce: Option<Instant>,
+    priority_windows: ActivePriorityWindows,
 }
 
 impl TorrentPlaybackState {
@@ -153,6 +270,7 @@ impl TorrentPlaybackState {
             acknowledged_priorities: None,
             metadata_announced: false,
             last_emergency_reannounce: None,
+            priority_windows: ActivePriorityWindows::default(),
         }
     }
 
@@ -212,6 +330,7 @@ impl TorrentPlaybackState {
             self.selected_file = Some(file_idx);
             self.selected_priority = native_priority;
             self.selected_first_piece = None;
+            self.priority_windows.clear_tracking();
         }
 
         if direct_permit {
@@ -247,6 +366,7 @@ impl TorrentPlaybackState {
         self.selected_file = None;
         self.selected_priority = 0;
         self.selected_first_piece = None;
+        self.priority_windows.clear_tracking();
         self.hls_last_activity = None;
         self.idle_deadline = None;
         self.phase = LibtorrentNetworkPhase::PausePending;
@@ -308,10 +428,18 @@ impl PauseSilenceTracker {
 }
 
 enum PlaybackCommand {
+    ReplacePriorityWindow {
+        info_hash: String,
+        file_idx: usize,
+        generation: u64,
+        stream_id: usize,
+        assignments: Vec<LibtorrentPiecePriority>,
+    },
     ReleasePlayback {
         info_hash: String,
         file_idx: usize,
         generation: u64,
+        stream_id: usize,
         foreground: bool,
     },
     ReleaseMetadata {
@@ -623,6 +751,7 @@ impl LibtorrentPlaybackCoordinator {
             info_hash: info_hash.clone(),
             file_idx: start.file_idx,
             generation: selection.generation,
+            stream_id: start.stream_id,
             cancellation: selection.cancellation.clone(),
             command_tx: self.command_tx.clone(),
             foreground,
@@ -681,6 +810,7 @@ impl LibtorrentPlaybackCoordinator {
 
         let start = LibtorrentPlaybackStart {
             file_idx,
+            stream_id: HLS_PRIORITY_STREAM_ID,
             start_offset: 0,
             priority: 1,
             intent: PlaybackIntent::HlsInitial,
@@ -806,6 +936,14 @@ impl LibtorrentPlaybackCoordinator {
             return Ok(());
         }
 
+        if selection.changed {
+            let session = self.session.read().await;
+            let mut handle = session
+                .find_torrent(info_hash)
+                .map_err(|error| anyhow!("Torrent not found: {error}"))?;
+            handle.clear_piece_deadlines();
+        }
+
         let desired = desired_priorities(
             layout.files.len(),
             start.file_idx,
@@ -868,7 +1006,7 @@ impl LibtorrentPlaybackCoordinator {
         }
 
         let first_piece = self
-            .apply_hot_window(info_hash, layout, start, selection.generation)
+            .apply_hot_window(info_hash, entry, layout, start, selection.generation)
             .await?;
         {
             let mut state = entry.state.lock().await;
@@ -1061,6 +1199,7 @@ impl LibtorrentPlaybackCoordinator {
     async fn apply_hot_window(
         &self,
         info_hash: &str,
+        entry: &TorrentPlaybackEntry,
         layout: &TorrentLayout,
         start: &LibtorrentPlaybackStart,
         generation: u64,
@@ -1115,15 +1254,29 @@ impl LibtorrentPlaybackCoordinator {
             .filter(|assignment| {
                 assignment.piece_idx >= file.first_piece && assignment.piece_idx <= file.last_piece
             })
+            .map(|assignment| LibtorrentPiecePriority {
+                piece: assignment.piece_idx,
+                priority: assignment.piece_priority,
+                deadline_ms: if matches!(
+                    start.intent,
+                    PlaybackIntent::InternalProbe | PlaybackIntent::Background
+                ) {
+                    None
+                } else {
+                    Some(assignment.deadline)
+                },
+            })
             .collect::<Vec<_>>();
-        handle.set_piece_priorities(
-            assignments
-                .iter()
-                .map(|assignment| (assignment.piece_idx, assignment.piece_priority)),
-        );
-        for assignment in assignments {
-            handle.set_piece_deadline(assignment.piece_idx, assignment.deadline);
-        }
+        drop(session);
+        self.replace_priority_window_locked(
+            info_hash,
+            entry,
+            start.file_idx,
+            generation,
+            start.stream_id,
+            assignments,
+        )
+        .await?;
         tracing::info!(
             info_hash = %info_hash,
             file_idx = start.file_idx,
@@ -1134,6 +1287,71 @@ impl LibtorrentPlaybackCoordinator {
             "libtorrent hot playback window applied"
         );
         Ok(first_piece)
+    }
+
+    async fn replace_priority_window_locked(
+        &self,
+        info_hash: &str,
+        entry: &TorrentPlaybackEntry,
+        file_idx: usize,
+        generation: u64,
+        stream_id: usize,
+        assignments: Vec<LibtorrentPiecePriority>,
+    ) -> Result<bool> {
+        let (baseline_priority, changes) = {
+            let mut state = entry.state.lock().await;
+            if state.generation != generation || state.selected_file != Some(file_idx) {
+                return Ok(false);
+            }
+            let baseline_priority = state.selected_priority;
+            let changes = state.priority_windows.replace(stream_id, assignments);
+            (baseline_priority, changes)
+        };
+        self.apply_piece_priority_changes(info_hash, baseline_priority, &changes)
+            .await?;
+        Ok(true)
+    }
+
+    async fn apply_piece_priority_changes(
+        &self,
+        info_hash: &str,
+        baseline_priority: i32,
+        changes: &[PiecePriorityChange],
+    ) -> Result<()> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+
+        let session = self.session.read().await;
+        let mut handle = session
+            .find_torrent(info_hash)
+            .map_err(|error| anyhow!("Torrent not found: {error}"))?;
+        for change in changes {
+            match change {
+                PiecePriorityChange::Reset(piece)
+                | PiecePriorityChange::Apply(LibtorrentPiecePriority {
+                    piece,
+                    deadline_ms: None,
+                    ..
+                }) => handle.reset_piece_deadline(*piece),
+                PiecePriorityChange::Apply(_) => {}
+            }
+        }
+        handle.set_piece_priorities(changes.iter().map(|change| match change {
+            PiecePriorityChange::Apply(assignment) => (assignment.piece, assignment.priority),
+            PiecePriorityChange::Reset(piece) => (*piece, baseline_priority),
+        }));
+        for change in changes {
+            if let PiecePriorityChange::Apply(LibtorrentPiecePriority {
+                piece,
+                deadline_ms: Some(deadline_ms),
+                ..
+            }) = change
+            {
+                handle.set_piece_deadline(*piece, *deadline_ms);
+            }
+        }
+        Ok(())
     }
 
     fn schedule_emergency_reannounce(
@@ -1208,32 +1426,88 @@ impl LibtorrentPlaybackCoordinator {
 
     async fn handle_command(self: &Arc<Self>, command: PlaybackCommand) {
         match command {
+            PlaybackCommand::ReplacePriorityWindow {
+                info_hash,
+                file_idx,
+                generation,
+                stream_id,
+                assignments,
+            } => {
+                let entry = self.entry(&info_hash).await;
+                let _operation = entry.operation.lock().await;
+                if let Err(error) = self
+                    .replace_priority_window_locked(
+                        &info_hash,
+                        &entry,
+                        file_idx,
+                        generation,
+                        stream_id,
+                        assignments,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        info_hash = %info_hash,
+                        file_idx,
+                        generation,
+                        stream_id,
+                        %error,
+                        "Failed to reconcile libtorrent playback priority window"
+                    );
+                }
+            }
             PlaybackCommand::ReleasePlayback {
                 info_hash,
                 file_idx,
                 generation,
+                stream_id,
                 foreground,
             } => {
                 let entry = self.entry(&info_hash).await;
-                let mut state = entry.state.lock().await;
-                if let Some(count) = state.direct_permits.get_mut(&generation) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        state.direct_permits.remove(&generation);
+                let _operation = entry.operation.lock().await;
+                let (baseline_priority, changes, remaining_permits) = {
+                    let mut state = entry.state.lock().await;
+                    if let Some(count) = state.direct_permits.get_mut(&generation) {
+                        *count = count.saturating_sub(1);
+                        if *count == 0 {
+                            state.direct_permits.remove(&generation);
+                        }
                     }
-                }
-                if foreground && let Some(count) = state.foreground_permits.get_mut(&generation) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        state.foreground_permits.remove(&generation);
+                    if foreground && let Some(count) = state.foreground_permits.get_mut(&generation)
+                    {
+                        *count = count.saturating_sub(1);
+                        if *count == 0 {
+                            state.foreground_permits.remove(&generation);
+                        }
                     }
+                    let changes = if state.generation == generation {
+                        state.priority_windows.release(stream_id)
+                    } else {
+                        Vec::new()
+                    };
+                    let baseline_priority = state.selected_priority;
+                    state.schedule_idle_if_needed(Instant::now());
+                    (baseline_priority, changes, state.active_playback_permits())
+                };
+                if let Err(error) = self
+                    .apply_piece_priority_changes(&info_hash, baseline_priority, &changes)
+                    .await
+                {
+                    tracing::warn!(
+                        info_hash = %info_hash,
+                        file_idx,
+                        generation,
+                        stream_id,
+                        %error,
+                        "Failed to retire released libtorrent priority window"
+                    );
                 }
-                state.schedule_idle_if_needed(Instant::now());
                 tracing::debug!(
                     info_hash = %info_hash,
                     file_idx,
                     generation,
-                    remaining_permits = state.active_playback_permits(),
+                    stream_id,
+                    remaining_permits,
                     "Libtorrent playback permit released"
                 );
             }
@@ -1290,6 +1564,7 @@ impl LibtorrentPlaybackCoordinator {
                 }
                 let selected = {
                     let mut state = entry.state.lock().await;
+                    state.priority_windows.mark_piece_verified(piece);
                     if state.selected_first_piece == Some(piece) {
                         state.selected_first_piece = None;
                         tracing::info!(
@@ -1643,6 +1918,18 @@ fn file_count_bucket(file_count: usize) -> &'static str {
 mod tests {
     use super::*;
 
+    fn piece_priority(
+        piece: i32,
+        priority: i32,
+        deadline_ms: Option<i32>,
+    ) -> LibtorrentPiecePriority {
+        LibtorrentPiecePriority {
+            piece,
+            priority,
+            deadline_ms,
+        }
+    }
+
     #[test]
     fn priority_vector_size_is_constant_operation_for_large_torrent() {
         let priorities = desired_priorities(366, 365, 1).expect("valid file");
@@ -1726,6 +2013,64 @@ mod tests {
         assert!(!selection.changed);
         assert_eq!(state.phase, LibtorrentNetworkPhase::PausedIdle);
         assert_eq!(state.active_playback_permits(), 1);
+    }
+
+    #[test]
+    fn replacing_a_stream_window_resets_only_retired_pieces() {
+        let mut windows = ActivePriorityWindows::default();
+        windows.replace(
+            1,
+            vec![
+                piece_priority(10, 7, Some(0)),
+                piece_priority(11, 4, Some(500)),
+            ],
+        );
+
+        let changes = windows.replace(
+            1,
+            vec![
+                piece_priority(11, 4, Some(500)),
+                piece_priority(12, 4, Some(1_000)),
+            ],
+        );
+
+        assert_eq!(
+            changes,
+            vec![
+                PiecePriorityChange::Reset(10),
+                PiecePriorityChange::Apply(piece_priority(12, 4, Some(1_000))),
+            ]
+        );
+    }
+
+    #[test]
+    fn overlapping_stream_keeps_piece_urgent_until_last_release() {
+        let mut windows = ActivePriorityWindows::default();
+        windows.replace(1, vec![piece_priority(10, 7, Some(500))]);
+
+        assert_eq!(
+            windows.replace(2, vec![piece_priority(10, 4, Some(100))]),
+            vec![PiecePriorityChange::Apply(piece_priority(10, 7, Some(100)))]
+        );
+        assert_eq!(
+            windows.release(2),
+            vec![PiecePriorityChange::Apply(piece_priority(10, 7, Some(500)))]
+        );
+        assert_eq!(windows.release(1), vec![PiecePriorityChange::Reset(10)]);
+    }
+
+    #[test]
+    fn background_lease_does_not_remove_foreground_deadline() {
+        let mut windows = ActivePriorityWindows::default();
+        windows.replace(1, vec![piece_priority(20, 7, Some(0))]);
+
+        assert!(
+            windows
+                .replace(2, vec![piece_priority(20, 1, None)])
+                .is_empty()
+        );
+        assert_eq!(windows.release(2), Vec::<PiecePriorityChange>::new());
+        assert_eq!(windows.release(1), vec![PiecePriorityChange::Reset(20)]);
     }
 
     #[tokio::test(start_paused = true)]

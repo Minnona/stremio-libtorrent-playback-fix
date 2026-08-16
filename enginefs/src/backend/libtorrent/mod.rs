@@ -387,6 +387,7 @@ impl LibtorrentBackend {
             // Fetch accurate alert types directly from C++ libtorrent
             let piece_finished_alert_type = libtorrent_sys::get_piece_finished_alert_type();
             let hash_failed_alert_type = libtorrent_sys::get_hash_failed_alert_type();
+            let performance_alert_type = libtorrent_sys::get_performance_alert_type();
 
             loop {
                 interval.tick().await;
@@ -411,6 +412,14 @@ impl LibtorrentBackend {
                             info_hash = %alert.info_hash,
                             alert_message = %alert.message,
                             "piece hash validation failed; libtorrent will retry"
+                        );
+                    }
+
+                    if alert.alert_type == performance_alert_type {
+                        tracing::warn!(
+                            info_hash = %alert.info_hash,
+                            alert_message = %alert.message,
+                            "libtorrent performance warning"
                         );
                     }
 

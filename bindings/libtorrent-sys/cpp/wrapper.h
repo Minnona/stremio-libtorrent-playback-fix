@@ -198,6 +198,7 @@ int32_t get_file_prio_alert_type();
 int32_t get_torrent_paused_alert_type();
 int32_t get_torrent_resumed_alert_type();
 int32_t get_file_error_alert_type();
+int32_t get_performance_alert_type();
 
 // Direct memory piece read — bypasses libtorrent's read_piece()
 rust::Vec<uint8_t> memory_read_piece_direct(rust::Str info_hash, int32_t piece);

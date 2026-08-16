@@ -542,6 +542,7 @@ mod ffi {
         fn get_torrent_paused_alert_type() -> i32;
         fn get_torrent_resumed_alert_type() -> i32;
         fn get_file_error_alert_type() -> i32;
+        fn get_performance_alert_type() -> i32;
 
         /// Read piece data directly from memory storage, bypassing libtorrent's
         /// internal read_piece() which fails with custom disk interfaces.

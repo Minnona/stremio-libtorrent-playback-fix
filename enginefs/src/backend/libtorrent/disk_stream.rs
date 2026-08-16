@@ -7,13 +7,17 @@ use std::time::{Duration, Instant};
 
 use crate::backend::priorities::{
     BLOCKED_REPLAN_INTERVAL_MS, PlaybackIntent, disk_backed_forward_window_pieces_for,
+    playback_deadline_step_ms,
 };
 use crate::metadata_pins::MetadataPinRegistry;
 use crate::piece_waiter::PieceWaiterRegistry;
 
 const INITIAL_FIRST_BYTE_WINDOW_PIECES: i32 = 3;
-const URGENT_REASSERT_INTERVAL_MS: u64 = 8_000;
 type PieceReadTask = tokio::task::JoinHandle<std::io::Result<Arc<Vec<u8>>>>;
+
+fn forward_window_end(piece: i32, last_piece: i32, piece_count: i32) -> i32 {
+    last_piece.min(piece.saturating_add(piece_count.saturating_sub(1)))
+}
 
 fn broker_slice_bounds(
     piece: i32,
@@ -55,6 +59,7 @@ pub(crate) struct LibtorrentDiskFileStream {
     current_pos: u64,
     stream_id: usize,
     playback_intent: PlaybackIntent,
+    bitrate_bytes_per_sec: Option<u64>,
     piece_waiter: Arc<PieceWaiterRegistry>,
     metadata_pins: Arc<MetadataPinRegistry>,
     created_at: Instant,
@@ -63,8 +68,6 @@ pub(crate) struct LibtorrentDiskFileStream {
     last_prioritized_piece: i32,
     consecutive_waits: u32,
     last_blocked_replan: Instant,
-    last_urgent_reassert: Instant,
-    urgent_reassert_count: u32,
     file: Option<tokio::fs::File>,
     file_cursor: u64,
     seek_pending: bool,
@@ -94,6 +97,7 @@ impl LibtorrentDiskFileStream {
         file_idx: usize,
         stream_id: usize,
         playback_intent: PlaybackIntent,
+        bitrate_bytes_per_sec: Option<u64>,
         piece_waiter: Arc<PieceWaiterRegistry>,
         metadata_pins: Arc<MetadataPinRegistry>,
         file: Option<tokio::fs::File>,
@@ -114,6 +118,7 @@ impl LibtorrentDiskFileStream {
             current_pos: 0,
             stream_id,
             playback_intent,
+            bitrate_bytes_per_sec,
             piece_waiter,
             metadata_pins,
             created_at: Instant::now(),
@@ -124,10 +129,6 @@ impl LibtorrentDiskFileStream {
             last_prioritized_piece: -1,
             consecutive_waits: 0,
             last_blocked_replan: Instant::now(),
-            last_urgent_reassert: Instant::now()
-                .checked_sub(Duration::from_millis(URGENT_REASSERT_INTERVAL_MS))
-                .unwrap_or_else(Instant::now),
-            urgent_reassert_count: 0,
             file,
             file_cursor: 0,
             seek_pending: false,
@@ -171,12 +172,13 @@ impl LibtorrentDiskFileStream {
         }
 
         match intent {
-            // Cold starts only need a tiny head cluster before the first byte;
-            // seeks need the full configured cluster because players commonly
-            // pull several pieces immediately for demux/decode after the seek.
+            // Cold starts only need a tiny head cluster before the first byte.
+            // A cold seek is even narrower: fetch the exact requested piece,
+            // then expand the window as soon as bytes begin flowing.
             PlaybackIntent::DirectInitial | PlaybackIntent::HlsInitial => {
                 configured_forward_window.min(INITIAL_FIRST_BYTE_WINDOW_PIECES)
             }
+            PlaybackIntent::DirectSeek | PlaybackIntent::HlsSeek => 1,
             _ => configured_forward_window,
         }
     }
@@ -220,14 +222,22 @@ impl LibtorrentDiskFileStream {
         missing
     }
 
-    /// Re-assert pinned metadata pieces at top priority with an immediate
-    /// deadline so a head stream's `set_file_priority` can't strip the rare
-    /// Cues/moov region while it is still downloading.
-    fn apply_pinned_metadata(&mut self, pinned_missing: &[i32]) {
+    fn extend_with_pinned_metadata(
+        &self,
+        assignments: &mut Vec<super::playback::LibtorrentPiecePriority>,
+        pinned_missing: &[i32],
+    ) {
         for &p in pinned_missing {
-            if p >= self.first_piece && p <= self.last_piece && !self.handle.have_piece(p) {
-                self.handle.set_piece_priority(p, 7);
-                self.handle.set_piece_deadline(p, 0);
+            if p >= self.first_piece
+                && p <= self.last_piece
+                && !self.handle.have_piece(p)
+                && !assignments.iter().any(|assignment| assignment.piece == p)
+            {
+                assignments.push(super::playback::LibtorrentPiecePriority {
+                    piece: p,
+                    priority: 7,
+                    deadline_ms: Some(0),
+                });
             }
         }
     }
@@ -243,10 +253,21 @@ impl LibtorrentDiskFileStream {
         self.last_prioritized_piece = piece;
 
         if self.is_background_reader() {
-            if !self.handle.have_piece(piece) {
-                self.handle.set_piece_priority(piece, 4);
-                self.handle.set_piece_deadline(piece, 500);
-            }
+            let assignments = if self.handle.have_piece(piece) {
+                Vec::new()
+            } else {
+                let priority = if matches!(self.playback_intent, PlaybackIntent::Background) {
+                    1
+                } else {
+                    2
+                };
+                vec![super::playback::LibtorrentPiecePriority {
+                    piece,
+                    priority,
+                    deadline_ms: None,
+                }]
+            };
+            self.playback_permit.replace_priority_window(assignments);
             return;
         }
 
@@ -256,7 +277,7 @@ impl LibtorrentDiskFileStream {
         let configured_forward_window =
             disk_backed_forward_window_pieces_for(priority_intent, self.piece_length);
         let forward_window = self.active_forward_window(priority_intent, configured_forward_window);
-        let window_end = self.last_piece.min(piece + forward_window);
+        let window_end = forward_window_end(piece, self.last_piece, forward_window);
         let presence = self.handle.piece_presence(piece, window_end);
 
         // A tail-seek (Cues/moov) stream records its window as metadata-critical
@@ -278,9 +299,9 @@ impl LibtorrentDiskFileStream {
 
         // While rare Cues/moov pieces are still missing, a head stream drops its
         // read-ahead window from 7 to 4 so the few peers that hold the tail feed
-        // it first. The head's CURRENT piece still stays urgent via
-        // reassert_requested_piece below; only read-ahead yields. The metadata
-        // stream itself keeps full priority; background reads stay at 1.
+        // it first. The head's current piece remains priority 7; only read-ahead
+        // yields. The metadata stream itself keeps full priority; background
+        // reads stay at 1.
         let read_ahead_priority = if matches!(priority_intent, PlaybackIntent::Background) {
             1
         } else if matches!(priority_intent, PlaybackIntent::InternalProbe) {
@@ -289,38 +310,34 @@ impl LibtorrentDiskFileStream {
             4
         };
         let deadline_jitter = (self.stream_id % 10) as i32 * 5;
-        let assignments = (piece..=window_end)
+        let status = self.handle.status();
+        let deadline_step = playback_deadline_step_ms(
+            self.piece_length,
+            self.bitrate_bytes_per_sec,
+            status.download_rate.max(0) as u64,
+        );
+        let mut assignments = (piece..=window_end)
             .filter(|p| piece_is_missing(&presence, piece, *p))
             .map(|p| {
                 let distance = p - piece;
                 let deadline = if distance == 0 {
                     0
                 } else {
-                    distance * 250 + deadline_jitter
+                    distance * deadline_step + deadline_jitter
                 };
-                (
-                    p,
-                    if distance == 0 {
+                super::playback::LibtorrentPiecePriority {
+                    piece: p,
+                    priority: if distance == 0 {
                         7
                     } else {
                         read_ahead_priority
                     },
-                    deadline,
-                )
+                    deadline_ms: Some(deadline),
+                }
             })
             .collect::<Vec<_>>();
-        self.handle.set_piece_priorities(
-            assignments
-                .iter()
-                .map(|(piece, priority, _)| (*piece, *priority)),
-        );
-        for (piece, _, deadline) in assignments {
-            self.handle.set_piece_deadline(piece, deadline);
-        }
-        self.reassert_requested_piece(piece, "initial-window");
-        // Re-assert pinned Cues/moov LAST so the set_file_priority above (and the
-        // baseline-0 wipe inside reassert) can't strip the rare tail region.
-        self.apply_pinned_metadata(&pinned_missing);
+        self.extend_with_pinned_metadata(&mut assignments, &pinned_missing);
+        self.playback_permit.replace_priority_window(assignments);
 
         tracing::debug!(
             info_hash = %self.info_hash,
@@ -337,40 +354,9 @@ impl LibtorrentDiskFileStream {
         );
     }
 
-    fn reassert_requested_piece(&mut self, piece: i32, reason: &'static str) {
-        if piece < self.first_piece || piece > self.last_piece || self.handle.have_piece(piece) {
-            return;
-        }
-
-        let priority_intent = self.priority_intent();
-        self.handle.set_piece_priority(piece, 7);
-        self.handle.set_piece_deadline(piece, 0);
-        self.last_urgent_reassert = Instant::now();
-        self.urgent_reassert_count = self.urgent_reassert_count.saturating_add(1);
-
-        if self.urgent_reassert_count <= 3 || self.urgent_reassert_count.is_multiple_of(20) {
-            let status = self.handle.status();
-            tracing::info!(
-                info_hash = %self.info_hash,
-                file_idx = self.file_idx,
-                intent = ?self.playback_intent,
-                priority_intent = ?priority_intent,
-                piece,
-                reassert_count = self.urgent_reassert_count,
-                peers = status.num_peers,
-                download_rate = status.download_rate,
-                elapsed_ms = self.created_at.elapsed().as_millis() as u64,
-                reason,
-                "requested piece forced urgent"
-            );
-        }
-    }
-
-    /// Re-assert deadlines for a blocking piece and expand the window when the
-    /// stream keeps waiting. Without this, `prioritize_from`'s
-    /// `last_prioritized_piece` guard means deadlines are set exactly once per
-    /// piece, so a choked swarm can stall the stream indefinitely with no
-    /// recovery until the player itself times out and re-requests.
+    /// Replan a blocking piece after the swarm has had time to react. The
+    /// coordinator only applies changed leases, so an identical plan does not
+    /// push an already-urgent deadline farther into the future.
     fn escalate_blocked_piece(&mut self, piece: i32) {
         if self.last_blocked_replan.elapsed() < Duration::from_millis(BLOCKED_REPLAN_INTERVAL_MS) {
             return;
@@ -381,28 +367,28 @@ impl LibtorrentDiskFileStream {
         let mut forward_window =
             disk_backed_forward_window_pieces_for(priority_intent, self.piece_length);
         forward_window = self.active_forward_window(priority_intent, forward_window);
-        let window_end = self.last_piece.min(piece + forward_window);
+        let window_end = forward_window_end(piece, self.last_piece, forward_window);
         let presence = self.handle.piece_presence(piece, window_end);
-        let assignments = (piece..=window_end)
+        let status = self.handle.status();
+        let deadline_step = playback_deadline_step_ms(
+            self.piece_length,
+            self.bitrate_bytes_per_sec,
+            status.download_rate.max(0) as u64,
+        );
+        let mut assignments = (piece..=window_end)
             .filter(|p| piece_is_missing(&presence, piece, *p))
             .map(|p| {
                 let distance = p - piece;
-                (p, if distance == 0 { 7 } else { 4 }, distance * 250)
+                super::playback::LibtorrentPiecePriority {
+                    piece: p,
+                    priority: if distance == 0 { 7 } else { 4 },
+                    deadline_ms: Some(distance * deadline_step),
+                }
             })
             .collect::<Vec<_>>();
-        self.handle.set_piece_priorities(
-            assignments
-                .iter()
-                .map(|(piece, priority, _)| (*piece, *priority)),
-        );
-        for (piece, _, deadline) in assignments {
-            self.handle.set_piece_deadline(piece, deadline);
-        }
-        self.reassert_requested_piece(piece, "blocked-replan");
-        // Keep pinned Cues/moov urgent (deadline 0) so they out-rank this
-        // window's read-ahead deadlines even though both sit at priority 7.
         let pinned_missing = self.pinned_metadata_missing();
-        self.apply_pinned_metadata(&pinned_missing);
+        self.extend_with_pinned_metadata(&mut assignments, &pinned_missing);
+        self.playback_permit.replace_priority_window(assignments);
 
         tracing::debug!(
             info_hash = %self.info_hash,
@@ -423,11 +409,6 @@ impl LibtorrentDiskFileStream {
         self.consecutive_waits = self.consecutive_waits.saturating_add(1);
         self.prioritize_from(piece);
         if !self.is_background_reader() {
-            if self.last_urgent_reassert.elapsed()
-                >= Duration::from_millis(URGENT_REASSERT_INTERVAL_MS)
-            {
-                self.reassert_requested_piece(piece, "wait-reassert");
-            }
             self.escalate_blocked_piece(piece);
         }
         self.piece_waiter
@@ -450,7 +431,7 @@ impl LibtorrentDiskFileStream {
                 disk_backed_forward_window_pieces_for(self.playback_intent, self.piece_length);
             let active_forward_window =
                 self.active_forward_window(self.playback_intent, configured_forward_window);
-            let cluster_end = self.last_piece.min(piece + active_forward_window);
+            let cluster_end = forward_window_end(piece, self.last_piece, active_forward_window);
             let active_presence = self.handle.piece_presence(piece, cluster_end);
             let ready_in_active_window = active_presence
                 .iter()
@@ -866,7 +847,7 @@ impl Drop for LibtorrentDiskFileStream {
 
 #[cfg(test)]
 mod tests {
-    use super::broker_slice_bounds;
+    use super::{broker_slice_bounds, forward_window_end};
 
     #[test]
     fn broker_slices_a_file_that_starts_inside_a_shared_piece() {
@@ -878,5 +859,12 @@ mod tests {
     #[test]
     fn broker_does_not_cross_the_selected_file_boundary() {
         assert_eq!(broker_slice_bounds(2, 16, 32, 0, 5, 16, 64), Some((0, 5)));
+    }
+
+    #[test]
+    fn forward_window_piece_count_has_no_off_by_one() {
+        assert_eq!(forward_window_end(100, 999, 8), 107);
+        assert_eq!(forward_window_end(997, 999, 8), 999);
+        assert_eq!(forward_window_end(100, 999, 1), 100);
     }
 }

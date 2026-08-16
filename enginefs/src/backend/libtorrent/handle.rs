@@ -240,12 +240,16 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
         intent: PlaybackIntent,
     ) -> Result<Box<dyn FileStreamTrait>> {
         tracing::debug!("get_file_reader: starting for file {}", file_idx);
+        let stream_id = self
+            .stream_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let playback_permit = self
             .playback
             .start_playback(
                 self,
                 LibtorrentPlaybackStart {
                     file_idx,
+                    stream_id,
                     start_offset,
                     priority,
                     intent,
@@ -356,10 +360,6 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             "libtorrent reader opened after coordinated activation"
         );
 
-        let stream_id = self
-            .stream_counter
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
         if matches!(self.storage_mode, LibtorrentStorageMode::DiskBacked) {
             let file_path = self.save_path.join(&file_info.path);
             let file = match tokio::fs::OpenOptions::new()
@@ -384,6 +384,7 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
                 file_idx,
                 stream_id,
                 playback_intent,
+                bitrate,
                 self.piece_waiter.clone(),
                 self.metadata_pins.clone(),
                 file,
@@ -411,7 +412,6 @@ impl TorrentHandleTrait for LibtorrentTorrentHandle {
             is_complete,
             last_priorities_piece: if !is_complete { actual_start_piece } else { -1 },
             cache_config: self.config.cache,
-            priority,
             bitrate,
             download_speed_ema: 0.0,
             stream_id,

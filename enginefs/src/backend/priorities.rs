@@ -25,6 +25,8 @@ pub const SEEK_IMMEDIATE_PIECES: i32 = 12;
 pub const MAX_HOT_PIECES: i32 = 96;
 pub const MAX_WARM_PIECES: i32 = 192;
 pub const BLOCKED_REPLAN_INTERVAL_MS: u64 = 8_000;
+const MIN_PIECE_DEADLINE_STEP_MS: u64 = 500;
+const MAX_PIECE_DEADLINE_STEP_MS: u64 = 30_000;
 
 /// Start treating reads as "container metadata" when they fall in the last 10MB
 /// or the last 5% of the file, whichever starts earlier.
@@ -120,18 +122,18 @@ pub fn disk_backed_file_baseline_priority(intent: PlaybackIntent) -> i32 {
 
 pub fn disk_backed_forward_window_pieces(intent: PlaybackIntent) -> i32 {
     match intent {
-        PlaybackIntent::DownloadFull => 63,
-        PlaybackIntent::DownloadRange => 7,
-        PlaybackIntent::DirectInitial | PlaybackIntent::HlsInitial => MAX_STARTUP_PIECES - 1,
-        PlaybackIntent::DirectSeek | PlaybackIntent::DirectSequential => 31,
-        PlaybackIntent::HlsSeek | PlaybackIntent::HlsSequential => 15,
+        PlaybackIntent::DownloadFull => 64,
+        PlaybackIntent::DownloadRange => 8,
+        PlaybackIntent::DirectInitial | PlaybackIntent::HlsInitial => MAX_STARTUP_PIECES,
+        PlaybackIntent::DirectSeek | PlaybackIntent::DirectSequential => 32,
+        PlaybackIntent::HlsSeek | PlaybackIntent::HlsSequential => 16,
         // The container seek index (MKV Cues / MP4 moov) spans several pieces;
         // 16 lets the 16 MB MAX_CONTAINER_METADATA_WINDOW_BYTES cap govern (via
         // cap_pieces_by_bytes) so the whole region downloads in parallel instead
         // of one rare piece at a time.
         PlaybackIntent::ContainerMetadata => 16,
         PlaybackIntent::InternalProbe => 1,
-        PlaybackIntent::Background => 0,
+        PlaybackIntent::Background => 1,
     }
 }
 
@@ -151,6 +153,26 @@ pub fn disk_backed_forward_window_pieces_for(intent: PlaybackIntent, piece_lengt
         PlaybackIntent::Background => MAX_CONTAINER_METADATA_WINDOW_BYTES,
     };
     cap_pieces_by_bytes(pieces, piece_length, byte_cap)
+}
+
+pub fn playback_deadline_step_ms(
+    piece_length: u64,
+    bitrate_bytes_per_sec: Option<u64>,
+    download_rate_bytes_per_sec: u64,
+) -> i32 {
+    let bitrate = bitrate_bytes_per_sec.filter(|rate| *rate > 0);
+    let download_rate = (download_rate_bytes_per_sec > 0).then_some(download_rate_bytes_per_sec);
+    let effective_rate = match (bitrate, download_rate) {
+        (Some(bitrate), Some(download_rate)) => bitrate.min(download_rate),
+        (Some(bitrate), None) => bitrate,
+        (None, Some(download_rate)) => download_rate,
+        (None, None) => 1024 * 1024,
+    };
+    let step_ms = piece_length
+        .saturating_mul(1_000)
+        .div_ceil(effective_rate)
+        .clamp(MIN_PIECE_DEADLINE_STEP_MS, MAX_PIECE_DEADLINE_STEP_MS);
+    step_ms as i32
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -308,6 +330,10 @@ impl PlaybackPriorityPolicy {
             }
             PlaybackIntent::DownloadFull => (2, 16, 0),
             PlaybackIntent::DownloadRange => (1, 4, 0),
+            PlaybackIntent::DirectSeek | PlaybackIntent::HlsSeek if !ctx.first_byte_sent => {
+                reason.push_str("-first-piece-only");
+                (1, 1, 0)
+            }
             PlaybackIntent::DirectSeek | PlaybackIntent::HlsSeek => {
                 let mut hot = dynamic_hot_window(&ctx, bitrate_ratio).max(MIN_SEEK_HOT_PIECES);
                 let mut immediate = SEEK_IMMEDIATE_PIECES;
@@ -484,13 +510,26 @@ fn assignment_for(
     immediate_pieces: i32,
     hot_pieces: i32,
 ) -> (PriorityBand, i32, i32) {
+    let deadline_step = playback_deadline_step_ms(
+        ctx.piece_length,
+        ctx.bitrate_bytes_per_sec,
+        ctx.download_rate_bytes_per_sec,
+    );
     match ctx.intent {
-        PlaybackIntent::ContainerMetadata => (PriorityBand::Metadata, 7, distance * 10),
-        PlaybackIntent::InternalProbe => (PriorityBand::Background, 1, 1_000 + distance * 250),
-        PlaybackIntent::Background => (PriorityBand::Background, 1, 20_000 + distance * 200),
-        _ if distance < immediate_pieces => (PriorityBand::Immediate, 7, distance * 25),
-        _ if distance < hot_pieces => (PriorityBand::Hot, 4, 1_500 + distance * 150),
-        _ => (PriorityBand::Warm, 2, 10_000 + distance * 250),
+        PlaybackIntent::ContainerMetadata => (PriorityBand::Metadata, 7, distance * deadline_step),
+        PlaybackIntent::InternalProbe => (
+            PriorityBand::Background,
+            1,
+            10_000 + distance * deadline_step,
+        ),
+        PlaybackIntent::Background => (
+            PriorityBand::Background,
+            1,
+            30_000 + distance * deadline_step,
+        ),
+        _ if distance < immediate_pieces => (PriorityBand::Immediate, 7, distance * deadline_step),
+        _ if distance < hot_pieces => (PriorityBand::Hot, 4, distance * deadline_step),
+        _ => (PriorityBand::Warm, 2, 10_000 + distance * deadline_step),
     }
 }
 
@@ -813,5 +852,36 @@ mod tests {
             disk_backed_forward_window_pieces_for(PlaybackIntent::DownloadRange, 64 * 1024 * 1024),
             1
         );
+    }
+
+    #[test]
+    fn cold_seek_only_prioritizes_the_requested_piece() {
+        let mut ctx = base_context(PlaybackIntent::DirectSeek);
+        ctx.first_byte_sent = false;
+        ctx.piece_length = 16 * 1024 * 1024;
+        let decision = PlaybackPriorityPolicy::decide(ctx);
+
+        assert_eq!(decision.assignments.len(), 1);
+        assert_eq!(decision.assignments[0].piece_idx, 100);
+        assert_eq!(decision.assignments[0].piece_priority, 7);
+        assert!(decision.reason.contains("first-piece-only"));
+    }
+
+    #[test]
+    fn deadlines_track_the_slower_of_playback_and_download_rates() {
+        let mut ctx = base_context(PlaybackIntent::DirectSequential);
+        ctx.piece_length = 16 * 1024 * 1024;
+        ctx.bitrate_bytes_per_sec = Some(8 * 1024 * 1024);
+        ctx.download_rate_bytes_per_sec = 32 * 1024 * 1024;
+        let deadline_step = playback_deadline_step_ms(
+            ctx.piece_length,
+            ctx.bitrate_bytes_per_sec,
+            ctx.download_rate_bytes_per_sec,
+        );
+        let decision = PlaybackPriorityPolicy::decide(ctx);
+
+        assert_eq!(deadline_step, 2_000);
+        assert_eq!(decision.assignments[0].deadline, 0);
+        assert_eq!(decision.assignments[1].deadline, 2_000);
     }
 }
