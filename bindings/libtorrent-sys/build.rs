@@ -28,8 +28,10 @@ fn main() {
         build.define("TORRENT_LINKING_STATIC", None);
         build.define("BOOST_ASIO_STATIC_LINK", None);
 
-        let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-        if target_os != "android" {
+        // The Windows vcpkg build supplies Boost.Asio's separately compiled
+        // implementation. Linux vcpkg uses header-only Asio, so defining this
+        // there would leave the wrapper with unresolved Asio symbols.
+        if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
             build.define("BOOST_ASIO_SEPARATE_COMPILATION", None);
         }
     }
