@@ -582,6 +582,20 @@ impl LibtorrentPlaybackCoordinator {
         let started = Instant::now();
         loop {
             if let Some(layout) = self.query_layout(info_hash).await? {
+                // A freshly resolved magnet starts with libtorrent's default
+                // priority for every piece. Even a few milliseconds at that
+                // default can fill fast peers' request queues with unrelated
+                // pieces before HLS selects its playback window. Suppress all
+                // file traffic first; start_playback() will select the requested
+                // file and apply its urgent head/tail window.
+                let idle_priorities = vec![0; layout.files.len()];
+                if !idle_priorities.is_empty() {
+                    self.apply_file_priorities(info_hash, &idle_priorities)
+                        .await?;
+                    let entry = self.entry(info_hash).await;
+                    entry.state.lock().await.acknowledged_priorities =
+                        Some(idle_priorities);
+                }
                 tracing::info!(
                     info_hash = %info_hash,
                     elapsed_ms = started.elapsed().as_millis() as u64,

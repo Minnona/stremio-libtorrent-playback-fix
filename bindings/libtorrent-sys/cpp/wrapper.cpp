@@ -29,6 +29,7 @@
 #include <cstddef>
 #include <iterator>
 #include <sstream>
+#include <stdexcept>
 #include <utility>
 
 namespace libtorrent_wrapper {
@@ -50,9 +51,29 @@ static rust::String sha256_to_hex(const lt::sha256_hash &hash) {
 }
 
 static lt::sha1_hash hex_to_sha1(rust::Str hex) {
-  std::string hex_str(hex.data(), hex.size());
+  if (hex.size() != 40) {
+    throw std::invalid_argument("SHA-1 hash must contain exactly 40 hex characters");
+  }
+
+  const auto hex_value = [](char value) -> int {
+    if (value >= '0' && value <= '9')
+      return value - '0';
+    if (value >= 'a' && value <= 'f')
+      return value - 'a' + 10;
+    if (value >= 'A' && value <= 'F')
+      return value - 'A' + 10;
+    return -1;
+  };
+
   lt::sha1_hash hash;
-  lt::aux::from_hex(hex_str, hash.data());
+  for (std::size_t i = 0; i < 20; ++i) {
+    const int high = hex_value(hex.data()[2 * i]);
+    const int low = hex_value(hex.data()[2 * i + 1]);
+    if (high < 0 || low < 0) {
+      throw std::invalid_argument("SHA-1 hash contains a non-hex character");
+    }
+    hash.data()[i] = static_cast<char>((high << 4) | low);
+  }
   return hash;
 }
 
@@ -209,12 +230,12 @@ static void apply_streaming_performance_settings(lt::settings_pack &pack) {
   pack.set_bool(lt::settings_pack::smooth_connects, false);
   pack.set_int(lt::settings_pack::piece_timeout, 5);
 
-  // 2.1 raised these defaults. The larger outbound ceiling is also used by
-  // libtorrent's high-performance preset and avoids clipping high-BDP peers;
-  // the inbound value preserves enough upload pipeline for reciprocity.
-  pack.set_int(lt::settings_pack::max_out_request_queue, 1500);
+  // Keep enough requests in flight for high throughput without allowing fast
+  // peers to accumulate seconds of unrelated bulk work that cannot be
+  // displaced promptly when HLS assigns a time-critical piece.
+  pack.set_int(lt::settings_pack::max_out_request_queue, 250);
   pack.set_int(lt::settings_pack::max_allowed_in_request_queue, 2000);
-  pack.set_int(lt::settings_pack::request_queue_time, 3);
+  pack.set_int(lt::settings_pack::request_queue_time, 1);
   pack.set_int(lt::settings_pack::unchoke_slots_limit, 20);
   pack.set_int(lt::settings_pack::alert_queue_size, 10000);
 }
@@ -319,8 +340,9 @@ std::unique_ptr<Session> create_session(SessionSettings const &settings) {
   pack.set_int(lt::settings_pack::max_queued_disk_bytes,
                128 * 1024 * 1024);
   pack.set_int(lt::settings_pack::aio_threads, 16);
-  pack.set_int(lt::settings_pack::whole_pieces_threshold, 30);
-  pack.set_bool(lt::settings_pack::piece_extent_affinity, true);
+  // Block-level picking lets newly urgent playback pieces preempt bulk work.
+  pack.set_int(lt::settings_pack::whole_pieces_threshold, 0);
+  pack.set_bool(lt::settings_pack::piece_extent_affinity, false);
   pack.set_bool(lt::settings_pack::no_atime_storage, true);
 
   // Playback needs storage/control alerts plus piece_finished_alert, whose

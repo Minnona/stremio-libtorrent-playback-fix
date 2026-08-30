@@ -297,17 +297,16 @@ impl LibtorrentDiskFileStream {
         let pinned_missing = self.pinned_metadata_missing();
         let cues_pending = !pinned_missing.is_empty();
 
-        // While rare Cues/moov pieces are still missing, a head stream drops its
-        // read-ahead window from 7 to 4 so the few peers that hold the tail feed
-        // it first. The head's current piece remains priority 7; only read-ahead
-        // yields. The metadata stream itself keeps full priority; background
-        // reads stay at 1.
+        // Keep the complete foreground read-ahead window at the highest piece
+        // priority. Deadlines still order the current piece ahead of later
+        // pieces and metadata pins use an immediate deadline, while avoiding a
+        // bulk priority-1 queue starving HLS gaps on fast swarms.
         let read_ahead_priority = if matches!(priority_intent, PlaybackIntent::Background) {
             1
         } else if matches!(priority_intent, PlaybackIntent::InternalProbe) {
             2
         } else {
-            4
+            7
         };
         let deadline_jitter = (self.stream_id % 10) as i32 * 5;
         let status = self.handle.status();
@@ -381,7 +380,7 @@ impl LibtorrentDiskFileStream {
                 let distance = p - piece;
                 super::playback::LibtorrentPiecePriority {
                     piece: p,
-                    priority: if distance == 0 { 7 } else { 4 },
+                    priority: 7,
                     deadline_ms: Some(distance * deadline_step),
                 }
             })

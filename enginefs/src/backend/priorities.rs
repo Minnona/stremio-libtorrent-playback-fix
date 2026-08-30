@@ -528,7 +528,7 @@ fn assignment_for(
             30_000 + distance * deadline_step,
         ),
         _ if distance < immediate_pieces => (PriorityBand::Immediate, 7, distance * deadline_step),
-        _ if distance < hot_pieces => (PriorityBand::Hot, 4, distance * deadline_step),
+        _ if distance < hot_pieces => (PriorityBand::Hot, 7, distance * deadline_step),
         _ => (PriorityBand::Warm, 2, 10_000 + distance * deadline_step),
     }
 }

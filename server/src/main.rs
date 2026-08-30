@@ -221,6 +221,15 @@ mod app {
         let rt = tokio::runtime::Runtime::new()?;
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
         let mut cfg = stream_server::ServerConfig::binary_default();
+        if let Ok(value) = std::env::var("STREAM_SERVER_HTTP_PORT")
+            && let Ok(port) = value.parse::<u16>()
+        {
+            cfg.http_addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+            cfg.public_base_url = Some(format!("http://127.0.0.1:{port}"));
+        }
+        if std::env::var_os("STREAM_SERVER_DISABLE_HTTPS").is_some() {
+            cfg.https_addr = None;
+        }
         cfg.use_tui = use_tui;
         let _ = rt.block_on(stream_server::run(cfg, rx, None))?;
         Ok(())
