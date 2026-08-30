@@ -30,6 +30,8 @@ behind bulk downloading.
   `aux::from_hex` function.
 - `STREAM_SERVER_HTTP_PORT` and `STREAM_SERVER_DISABLE_HTTPS` can configure a
   localhost-only Stremio integration.
+- Restores Stremio Enhanced's local **Play in MPV** device and launch endpoint
+  when MPV is installed at `/usr/bin/mpv` or `/usr/local/bin/mpv`.
 
 The queue values are intentionally conservative. More testing across different
 connections and swarms is welcome.
@@ -47,7 +49,8 @@ STREAM_SERVER_HTTP_PORT=11470 STREAM_SERVER_DISABLE_HTTPS=1 \
 
 It is intended as a replacement backend for users already running Stream Server
 with Stremio. Fully stop the existing backend before replacing it, and keep a
-backup of the old executable.
+backup of the old executable. Set `STREAM_SERVER_MPV_PATH` if MPV is installed
+somewhere other than `/usr/bin/mpv` or `/usr/local/bin/mpv`.
 
 ## Build from source
 
