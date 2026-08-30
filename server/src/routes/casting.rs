@@ -295,6 +295,10 @@ async fn launch_mpv_after_updates(generation: u64) {
     let mut command = Command::new(path);
     command
         .arg("--no-terminal")
+        // The Stremio launcher isolates this server's settings with its own
+        // XDG_CONFIG_HOME. Do not pass that override to MPV, which must load
+        // the user's normal ~/.config/mpv configuration and scripts.
+        .env_remove("XDG_CONFIG_HOME")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());

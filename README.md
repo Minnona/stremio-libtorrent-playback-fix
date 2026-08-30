@@ -31,7 +31,8 @@ behind bulk downloading.
 - `STREAM_SERVER_HTTP_PORT` and `STREAM_SERVER_DISABLE_HTTPS` can configure a
   localhost-only Stremio integration.
 - Restores Stremio Enhanced's local **Play in MPV** device and launch endpoint
-  when MPV is installed at `/usr/bin/mpv` or `/usr/local/bin/mpv`.
+  when MPV is installed at `/usr/bin/mpv` or `/usr/local/bin/mpv`, while keeping
+  the user's normal `~/.config/mpv` configuration and scripts.
 
 The queue values are intentionally conservative. More testing across different
 connections and swarms is welcome.
