@@ -79,7 +79,7 @@ chrono = "0.4.42"
 sysinfo = "0.39.5"
 
 [target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))'.dependencies]
-tao = "0.35.3"
+tao = "0.37.0"
 settings-gui = { path = "../settings-gui" }
 
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
